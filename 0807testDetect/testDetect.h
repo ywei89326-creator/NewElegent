@@ -1,0 +1,218 @@
+﻿#pragma once
+
+#include <QtWidgets/QMainWindow>
+#include <QGraphicsScene>
+#include <QPointer>
+#include <QPolygonF>
+#include <QThread>
+#include <QVector>
+
+#include <functional>
+
+#include <opencv2/opencv.hpp>
+
+#include "include/TargetDetector.h"
+// 注意: 不要再 include TargetDetectorLib 的 TargetDetector1215.h ——
+// 它在全局命名空间重复定义了 TargetInfo / DetectionResult / TargetDetector,
+// 与上面 schneider0807 的同名(且 Layout 不同), 同时包含会 C2011 重定义。
+#include "MergeMarksBridge.h"   // 纯声明, 不含 PCL/VTK
+#include "ui_testDetect.h"
+
+class QCheckBox;
+class QDoubleSpinBox;
+class QGraphicsEllipseItem;
+class QGraphicsPathItem;
+class QGraphicsPixmapItem;
+class QGraphicsPolygonItem;
+class QGraphicsTextItem;
+class QGraphicsView;
+class QFormLayout;
+class QGroupBox;
+class QListWidget;
+class QListWidgetItem;
+class QPushButton;
+class QLabel;
+class QScrollArea;
+class QShortcut;
+class QSpinBox;
+class QTabWidget;
+
+// 参数栏里一个参数对应的「控件 + 读写方式」。
+//
+// 参数一共三十来个, 而每个参数都要参与同一套动作: 建控件 / 从控件读值 / 往控件写值 /
+// 存 ini / 读 ini / 还原默认。若为每个参数各写一遍就是几百行样板, 所以这里把它们收敛成
+// 一张表 —— 上层只对 m_fields 循环, 新增参数只要在 buildParamPane 里加一行 addXxxField()。
+// read/write 由成员指针生成(见 addIntField 等), 所以表里不必出现每个字段的名字。
+struct ParamField {
+    QString key;                                          // ini 键名(纯 ASCII)
+    QWidget* w = nullptr;                                 // QCheckBox / QSpinBox / QDoubleSpinBox
+    QGroupBox* group = nullptr;                           // 它属于哪个分组(整组联动禁用要用)
+    std::function<double(const DetectorParams&)> read;    // 参数集 -> 数值(填控件用)
+    std::function<void(DetectorParams&, double)> write;   // 数值 -> 参数集
+};
+
+// 编码靶标识别界面:
+//   导入图片 -> 开始识别 -> 结果列表(ID + 坐标) -> 开始画框, 勾选若干 ID
+//   在结果画面上高亮, 并连成一块 ROI 多边形。
+//   右侧下方还有「参数设置」栏, 直接编辑识别算法的调参项(见 buildParamPane)。
+class testDetect : public QMainWindow
+{
+    Q_OBJECT
+
+public:
+    testDetect(QWidget* parent = nullptr);
+    ~testDetect() override;
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+    void changeEvent(QEvent* event) override;
+
+private slots:
+    void onImportImage();
+    void onStartDetect();          // 识别编码片(原有行为)
+    void onStartDetectMarkers();   // 识别普通标记点(编码片中心圆那种实心亮圆盘)
+    void onToggleRoiMode(bool on);
+    void onItemChanged(QListWidgetItem* item);
+    void onItemClicked(QListWidgetItem* item);
+    void onClearSelection();
+    void onFitView();
+    void onTabChanged(int index);
+    void onParamEdited();          // 任一参数控件被改动 -> 标记"未应用"
+    void onApplyParams();          // 【应用参数】
+    void onResetParams();          // 【恢复默认】
+    void onSaveParamsFile();       // 【保存参数…】
+    void onLoadParamsFile();       // 【载入参数…】
+    void onToggleFullScreen();     // F11 / 【全屏】
+
+private:
+    // 一个识别结果对应的图元
+    struct Marker {
+        int id = -1;
+        bool isMarker = false;                  // true = 标记点模式(标签显示 M1..Mn, id 是序号)
+        QPointF pos;
+        bool subpixel = true;                   // false = 中心退回了整数轮廓, 不是亚像素的
+        QGraphicsPathItem* contour = nullptr;   // 亚像素拟合轮廓(倾斜时是椭圆)
+        QGraphicsEllipseItem* dot = nullptr;    // 亚像素中心点
+        QGraphicsTextItem* label = nullptr;
+    };
+
+    void buildUi();
+    void showImage(const cv::Mat& bgr);
+    void clearResults();
+    void finishDetect(const std::vector<DetectionResult>& results);
+    void applyHighlights();
+    void updateRoiStatus();
+    void updateZoomLabel();
+    void setBusy(bool busy);
+
+    // ---- 参数设置栏 ----
+    void buildParamPane(QWidget* paramPane);
+    // 往某个分组里加一个参数控件, 并把它注册进 m_fields; 返回新建的控件,
+    // 便于 buildParamPane 少数几处需要拿到具体控件(做联动禁用)。
+    // 三个 addXxxField 的唯一区别是控件类型与取值域, 读写都走传进来的成员指针。
+    QCheckBox* addBoolField(QFormLayout* form, const QString& key, const QString& label,
+        const QString& tip, bool DetectorParams::* member);
+    QSpinBox* addIntField(QFormLayout* form, const QString& key, const QString& label,
+        const QString& tip, int lo, int hi, int DetectorParams::* member);
+    QDoubleSpinBox* addDoubleField(QFormLayout* form, const QString& key, const QString& label,
+        const QString& tip, double lo, double hi, int decimals,
+        double DetectorParams::* member);
+
+    DetectorParams collectParams() const;                 // 控件 -> 参数集
+    void loadParamsToWidgets(const DetectorParams& p);    // 参数集 -> 控件
+    void applyParamsToDetector();                         // 控件 -> setParams -> 落盘
+    void setParamsDirty(bool dirty);                      // 更新"未应用"提示
+    void updateParamDependents();                         // 参数间的联动禁用
+
+    QString paramsIniPath() const;
+    void saveParamsIni();
+    bool loadParamsIni();                                 // 返回 false = 没有可用的 ini
+    static void writeParamsToSettings(const DetectorParams& p, const QVector<ParamField>& fields,
+        const QString& group, const QString& filePath);
+    static bool readParamsFromSettings(DetectorParams& p, const QVector<ParamField>& fields,
+        const QString& group, const QString& filePath);
+
+    // ---- 第二页「点云拼接」(MergeMarks) ----
+    // 懒加载: 第一次切到那一页才 LoadLibrary, 平时一个字节都不加载。
+    void ensureMergeMarksLoaded();
+    void showMergeMarksError(const QString& msg);
+
+    // 以选中点质心为中心按极角排序 —— 保证无论勾选先后, 都连成不自交的多边形
+    static QPolygonF buildRoiPolygon(const QVector<QPointF>& pts);
+
+    Ui::testDetectClass ui;
+
+    // 复用一个 detector: 去畸变映射表缓存在它里面, 导入时算一次识别时就不用再算
+    TargetDetector m_detector{ nullptr };
+    cv::Mat m_srcMat;                // 导入的原始图(未去畸变), 识别时喂给它
+    bool m_hasImage = false;
+    bool m_roiMode = false;          // 「开始画框」是否打开
+    bool m_busy = false;
+    bool m_markerMode = false;       // 最近一次识别是否为「识别标记点」(结果列表/状态栏据此换文案)
+    bool m_updatingList = false;     // 程序化改列表选中状态时抑制 itemSelectionChanged
+    bool m_autoFit = true;           // 用户手动缩放后置 false, 窗口 resize 就不再抢回适应窗口
+
+    QGraphicsScene* m_scene = nullptr;
+    QGraphicsView* m_view = nullptr;
+    QGraphicsPixmapItem* m_pixmapItem = nullptr;
+    QGraphicsPolygonItem* m_roiItem = nullptr;
+    QListWidget* m_list = nullptr;
+    QLabel* m_listTitle = nullptr;
+    QLabel* m_zoomLabel = nullptr;   // 状态栏右侧常驻的缩放比例
+
+    // ---- 参数设置栏 ----
+    QVector<ParamField> m_fields;
+    QWidget* m_paramPane = nullptr;        // 参数区整块(setBusy 时整体禁用)
+    QScrollArea* m_paramScroll = nullptr;
+    QLabel* m_paramHint = nullptr;         // "有未应用的改动" 提示行
+    QPushButton* m_btnApply = nullptr;
+    QPushButton* m_btnResetParams = nullptr;
+    QPushButton* m_btnSaveParams = nullptr;
+    QPushButton* m_btnLoadParams = nullptr;
+    QPushButton* m_btnFullScreen = nullptr;
+    QShortcut* m_shortcutEsc = nullptr;    // 只在全屏时启用, 避免抢走控件的 Esc
+    bool m_paramsDirty = false;
+    bool m_updatingParams = false;         // 程序化填控件时抑制"被改动"判定
+
+    // 联动禁用要用到的几个控件(见 updateParamDependents): 总开关关掉后, 那些
+    // "不再被算法读取"的参数要置灰, 免得用户对着一个不起作用的数字反复调。
+    QGroupBox* m_groupSubpixel = nullptr;
+    QCheckBox* m_chkSubpixel = nullptr;
+    QCheckBox* m_chkOtsu = nullptr;
+    QWidget* m_spinFixedThr = nullptr;
+    QCheckBox* m_chkOtsuK = nullptr;
+    QWidget* m_spinFixedKt = nullptr;
+
+    // 标签页 + 第二页(点云拼接)
+    QTabWidget* m_tabs = nullptr;
+    QWidget* m_mergeMarksPage = nullptr;
+    QLabel* m_mmPlaceholder = nullptr;
+    void* m_mmPanel = nullptr;       // MergeMarks_CreatePanel 返回的 QWidget*
+    void* m_mmModule = nullptr;      // MergeMarksLib.dll 的 HMODULE
+    FnMergeMarksDestroyPanel m_mmDestroy = nullptr;
+    bool m_mmLoadTried = false;      // 失败过就不再反复重试
+    QPushButton* m_btnImport = nullptr;
+    QPushButton* m_btnDetect = nullptr;
+    QPushButton* m_btnDetectMarkers = nullptr;
+    QPushButton* m_btnRoi = nullptr;
+    QPushButton* m_btnFit = nullptr;
+    QPushButton* m_btnClear = nullptr;
+
+    QVector<Marker> m_markers;
+    QPolygonF m_roiPolygon;          // 当前 ROI 多边形(图像像素坐标)
+    QVector<int> m_roiIds;           // 参与 ROI 的编码 id
+
+    // 图元尺寸随图像大小缩放, 保证不同分辨率下观感一致
+    double m_markRadius = 8.0;
+    double m_penW = 2.0;
+    double m_labelFontPx = 20.0;     // ID 标签字号(图像像素)
+
+    // 用于区分「点在勾选框上」和「点在行其他地方」:
+    // 点勾选框时 Qt 自己会切换, itemChanged 先于 itemClicked 触发, 比对状态就知道它翻过没有。
+    QListWidgetItem* m_pressedItem = nullptr;
+    Qt::CheckState m_pressedCheckState = Qt::Unchecked;
+
+    // 识别线程。用 QPointer 而不是裸指针: 线程跑完会 deleteLater 掉自己,
+    // 裸指针之后就是悬空的, 析构里再 isRunning() 就是 use-after-free。
+    QPointer<QThread> m_thread;
+};

@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 15
+VisualStudioVersion = 15.0.35213.121
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "0807testDetect", "0807testDetect\0807testDetect.vcxproj", "{8321C592-1C50-4E03-9901-668922B86688}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{8321C592-1C50-4E03-9901-668922B86688}.Debug|x64.ActiveCfg = Debug|x64
+		{8321C592-1C50-4E03-9901-668922B86688}.Debug|x64.Build.0 = Debug|x64
+		{8321C592-1C50-4E03-9901-668922B86688}.Release|x64.ActiveCfg = Release|x64
+		{8321C592-1C50-4E03-9901-668922B86688}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {60BE13CA-203D-43C1-A9F7-85758C628F28}
+	EndGlobalSection
+EndGlobal

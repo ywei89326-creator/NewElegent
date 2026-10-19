@@ -1,0 +1,157 @@
+﻿#pragma once
+
+#include <QObject>
+#include <QtGlobal>
+#include <opencv2/opencv.hpp>
+#include <mutex>
+#include <vector>
+
+using namespace std;
+using namespace cv;
+#ifndef BUILD_STATIC
+# if defined(SCHNEIDER0807_LIB)
+#  define SCHNEIDER0807_EXPORT Q_DECL_EXPORT
+# else
+#  define SCHNEIDER0807_EXPORT Q_DECL_IMPORT
+# endif
+#else
+# define SCHNEIDER0807_EXPORT
+#endif
+
+struct TargetInfo {
+	int id;     // 靶标ID，未识别返回-1
+	float x;    // 识别中心x坐标
+	float y;    // 识别中心y坐标
+};
+struct DetectionResult {
+	int id = -1;
+	cv::Point2f center;         // 亚像素中心(去畸变后图像坐标)
+	// 亚像素轮廓: 中心圆盘经 Zernike 亚像素边缘 + 最小二乘拟合的结果, 不是整数像素轮廓。
+	// 倾斜时圆在像面上成椭圆, 所以优先用 ellipse; 退化时退回按正圆(radius)画。
+	bool hasEllipse = false;    // true → 用 ellipse; false → 用 radius 按正圆画
+	cv::RotatedRect ellipse;    // 亚像素椭圆, 整幅图坐标
+	float radius = 0.f;         // 亚像素半径(兜底)
+
+	// ---- 质量信息: 判断这个中心到底是不是"真的亚像素" ----
+	// 亚像素精化失败时中心会退回整数轮廓拟合值(精度掉到 ~0.3px 量级), 光看 center 分辨不出来,
+	// 必须靠这三个字段区分。
+	bool  subpixel = false;     // true = 中心来自亚像素点最小二乘拟合; false = 退回了整数轮廓
+	// 拟合残差 RMS(像素)。**注意它不是标定过的精度**, 只反映"参与拟合的点离拟合椭圆的散布"。
+	// 选点带宽是 ±band·R(实测约 ±1.2px), 点若在带内均匀分布, RMS 天然就是 band/√3 ≈ 0.7px
+	// —— 实测值 0.69~0.72px 与之一致, 所以这个数偏大不等于精度差, 偏小也不等于精度好。
+	// 它的用处是**相对比较**: 某次识别明显高于其它次, 说明那次选点混进了非边缘点。
+	// 要确认绝对精度, 只能做重复性测试(固定靶标连拍 N 张, 看中心坐标的标准差)。
+	float rms = 0.f;
+	int   nPoints = 0;          // 参与拟合的亚像素点数
+};
+
+// 亚像素精化的质量信息, 与 refineCenters 的输出一一对应
+struct RefineQuality {
+	bool  subpixel = false;
+	float rms = 0.f;
+	int   nPoints = 0;
+};
+
+
+class SCHNEIDER0807_EXPORT TargetDetector : public QObject
+{
+	Q_OBJECT
+
+public:
+	TargetDetector(QObject *parent);
+	~TargetDetector();
+
+	int detectTargets(const unsigned char* imgData, int width, int height, int channels,
+		TargetInfo* targets, int maxTargets);
+
+	void setCameraParameters(const cv::Mat& cameraMatrix, const cv::Mat& distCoeffs);
+	std::vector<DetectionResult> detectTarget(cv::Mat& image);
+
+	// 中间过程可视化开关(OTSU/腐蚀/轮廓/各候选 debug 图)。
+	// 默认 false: 供 UI 或产线调用时静默运行, 不弹窗、不 waitKey 阻塞。
+	// 自己单独调试识别流程时 setDebugView(true) 打开。
+	void setDebugView(bool on) { m_debugView = on; }
+
+	// 返回与 detectTargets/detectTarget 同一(去畸变后)坐标系的图像, 供 UI 把识别结果叠加上去。
+	// 若直接显示原图, 因畸变(k1/k2 不为 0)叠加点会整体偏移。
+	cv::Mat undistortImage(const cv::Mat& src);
+
+private:
+	cv::Mat K;
+	cv::Mat distCoeffs;
+	bool m_debugView = false;
+
+	// 去畸变映射表缓存: cv::undistort 每次调用都会重算整张 remap 表(大图很贵),
+	// 这里按图像尺寸缓存一次, 之后只做 remap。setCameraParameters 会使其失效。
+	cv::Mat m_undistMap1;
+	cv::Mat m_undistMap2;
+	cv::Size m_undistMapSize;
+	std::mutex m_undistMutex;          // 去畸变表与图像内容无关, 只需按尺寸建一次
+	void ensureUndistortMap(cv::Size sz);
+	void undistortCached(const cv::Mat& src, cv::Mat& dst);
+
+	// 内部实现识别逻辑。
+	// details 非空时, 顺带把每个靶标的亚像素轮廓(拟合椭圆/半径)一并输出, 供 UI 叠加显示。
+	int detectTargetsImpl(const cv::Mat& img, TargetInfo* targets, int maxTargets,
+		std::vector<DetectionResult>* details = nullptr);
+
+	// 靶标ID和编码映射
+	std::map<int, uint16_t> idToCode;
+
+	// 辅助函数
+	std::vector<uint16_t> adjustCode(uint16_t code);
+	bool detectBoundary(const cv::Mat& t, const cv::Point2f& center, float a,
+		int angle_start, int angle_end, int& boundary_angle);
+
+
+
+
+	// gray_code = 保留编码环的二值图(含中心圆盘+跑道编码块), 供 decodeSingleTarget 采样;
+	// gray_clean = 预筛后只剩中心圆盘的二值图, 供候选检测。
+	void preprocessImage(const cv::Mat& img, cv::Mat& gray_clean, cv::Mat& gray_code,
+		cv::Mat& gray_blur,
+		std::vector<std::vector<cv::Point> >& contours);
+
+	// ellipses: 与 centers/radii 一一对应的粗椭圆(整数轮廓 fitEllipse), 倾斜时圆在像面是椭圆,
+	// 供后续 refineCenters 用 Zernike 亚像素点精化出亚像素椭圆。
+	void extractInitialCircles(const std::vector<std::vector<cv::Point> >& contours,
+		const cv::Mat& gray_blur,
+		std::vector<cv::Point2f>& centers,
+		std::vector<float>& radii,
+		std::vector<cv::RotatedRect>& ellipses);
+
+	void validateCircles(const cv::Mat& gray_clean,
+		const std::vector<cv::Point2f>& centers,
+		const std::vector<float>& radii,
+		const std::vector<cv::RotatedRect>& ellipses,
+		std::vector<cv::Point2f>& validCenters,
+		std::vector<float>& validRadii,
+		std::vector<cv::RotatedRect>& validEllipses);
+
+	void refineCenters(const cv::Mat& gray_blur,
+		const std::vector<cv::Point2f>& centers,
+		const std::vector<float>& radii,
+		const std::vector<cv::RotatedRect>& ellipses,
+		std::vector<cv::Point2f>& refinedCenters,
+		std::vector<float>& refinedRadii,
+		std::vector<cv::RotatedRect>& refinedEllipses,
+		std::vector<RefineQuality>& quality);
+
+	bool decodeSingleTarget(const cv::Mat& gray_clean,
+		const cv::Point2f& center, float radius,
+		const cv::RotatedRect& refEllipse,
+		int& matchedID, std::string& matchedBits,
+		cv::Mat& debugImage,
+		cv::RotatedRect& outEllipse,
+		bool& ellipseFound);
+
+
+	// 检查圆环上白色像素比例是否大于阈值（用于预筛选）
+	bool checkRingWhiteRatio(const Mat& roi, const Point2f& centerInROI, float radius, float ratioThreshold = 1.0f / 3.0f);
+
+
+
+};
+
+
+

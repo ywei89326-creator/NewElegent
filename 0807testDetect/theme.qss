@@ -1,0 +1,428 @@
+/* ==========================================================================
+   Dark tech theme - cyan accent.
+   Loaded by main.cpp from :/testDetect/theme.qss and applied with
+   qApp->setStyleSheet(), so it also covers the MergeMarksLib.dll panel
+   (same QApplication), i.e. both tabs share one theme.
+
+   Palette
+     window     #12161c      viewport / base   #1a2028
+     card       #1b222b      border            #263140
+     text       #dbe4ee      text dim          #8b9bb0
+     accent     #22d3ee      accent dark       #1f6f8b
+
+   Rules for this file:
+   - ASCII only. Keep every Chinese string out of here: the two projects have
+     OPPOSITE literal-encoding conventions (see CLAUDE.md in both repos), and a
+     resource file sidesteps that entirely.
+   - Do NOT set font-family on QListWidget / QTextEdit / QPlainTextEdit. Their
+     monospace font is set with setFont() in code so the numeric columns line
+     up; a stylesheet font-family would override it.
+   - Do NOT set a global "QWidget { background-color }". Some containers must
+     stay transparent (the QVTKWidget / OpenGL surfaces, tab pages). Backgrounds
+     are set per-container below instead.
+   ========================================================================== */
+
+/* ---------------------------------------------------------------- base ---- */
+/* NOTE: no font-family / font-size here on purpose. A global rule also matches
+   QListWidget and QTextEdit, and a stylesheet font property outranks the font
+   those widgets get from setFont() in code - which would replace the monospace
+   font and destroy the numeric column alignment in the result list and log.
+   The base font is set on the QApplication in main.cpp instead. */
+QWidget {
+    color: #dbe4ee;
+}
+
+QMainWindow {
+    background-color: #12161c;
+}
+
+QDialog {
+    background-color: #12161c;
+}
+
+QToolTip {
+    background-color: #1b222b;
+    color: #dbe4ee;
+    border: 1px solid #22d3ee;
+    border-radius: 4px;
+    padding: 4px 8px;
+}
+
+QToolTip:disabled {
+    color: #8b9bb0;
+}
+
+/* ---------------------------------------------------------------- tabs ---- */
+QTabWidget::pane {
+    background-color: #161b23;
+    border: 1px solid #263140;
+    border-radius: 8px;
+    top: -1px;
+}
+
+QTabBar {
+    background: transparent;
+}
+
+QTabBar::tab {
+    background: transparent;
+    color: #8b9bb0;
+    padding: 7px 22px;
+    margin-right: 2px;
+    border: none;
+    border-bottom: 2px solid transparent;
+}
+
+QTabBar::tab:hover {
+    color: #dbe4ee;
+}
+
+QTabBar::tab:selected {
+    color: #22d3ee;
+    border-bottom: 2px solid #22d3ee;
+}
+
+/* ------------------------------------------------------------ group box --- */
+/* Cards. Also styles the DLL panel's groupLoad / groupAlign / groupLog. */
+QGroupBox {
+    background-color: #1b222b;
+    border: 1px solid #263140;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding: 12px 10px 8px 10px;
+    font-size: 12px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0 5px;
+    color: #22d3ee;
+    font-weight: bold;
+}
+
+/* --------------------------------------------------------------- button --- */
+QPushButton {
+    background-color: #1f6f8b;
+    color: #eaf6fa;
+    border: 1px solid #2b8aa8;
+    border-radius: 6px;
+    padding: 6px 16px;
+    min-height: 18px;
+}
+
+QPushButton:hover {
+    background-color: #2a89a8;
+    border: 1px solid #22d3ee;
+    color: #ffffff;
+}
+
+QPushButton:pressed {
+    background-color: #17566d;
+    border: 1px solid #22d3ee;
+}
+
+/* The "start ROI" button is checkable - its on/off state must be obvious. */
+QPushButton:checked {
+    background-color: #22d3ee;
+    color: #08161c;
+    border: 1px solid #7ff0ff;
+    font-weight: bold;
+}
+
+QPushButton:checked:hover {
+    background-color: #4ae0f5;
+}
+
+/* setBusy() disables a whole row of buttons while detecting. */
+QPushButton:disabled {
+    background-color: #1a1f26;
+    color: #55606e;
+    border: 1px solid #232a34;
+}
+
+/* -------------------------------------------------------------- splitter --- */
+QSplitter::handle {
+    background-color: #263140;
+}
+
+QSplitter::handle:horizontal {
+    width: 3px;
+}
+
+QSplitter::handle:vertical {
+    height: 3px;
+}
+
+QSplitter::handle:hover {
+    background-color: #22d3ee;
+}
+
+/* ----------------------------------------------------------------- label --- */
+QLabel {
+    background: transparent;
+    color: #dbe4ee;
+}
+
+/* Section heading. The result-list title is given objectName "sectionTitle"
+   in testDetect.cpp, because the host builds its widgets in code and sets no
+   other object names. */
+QLabel#sectionTitle {
+    color: #22d3ee;
+    font-weight: bold;
+    font-size: 12px;
+    letter-spacing: 1px;
+    padding: 2px 0 2px 2px;
+}
+
+/* ------------------------------------------------------------ graphics view */
+/* The viewport itself is painted with an explicit background brush in code;
+   this only frames it. */
+QGraphicsView {
+    border: 1px solid #263140;
+    background-color: #1a2028;
+}
+
+/* ------------------------------------------------------------ status bar --- */
+QStatusBar {
+    background-color: #0e1218;
+    color: #8b9bb0;
+    border-top: 1px solid #263140;
+}
+
+QStatusBar::item {
+    border: none;
+}
+
+/* --------------------------------------------------------------- list ----- */
+/* No font-family here on purpose - see the header note. */
+QListWidget {
+    background-color: #161b23;
+    border: 1px solid #263140;
+    border-radius: 8px;
+    padding: 4px;
+    outline: none;
+}
+
+QListWidget::item {
+    color: #cfd9e4;
+    padding: 5px 6px;
+    border-radius: 4px;
+}
+
+QListWidget::item:alternate {
+    background-color: #191f28;
+}
+
+QListWidget::item:hover {
+    background-color: #1f2a36;
+}
+
+QListWidget::item:selected {
+    background-color: #1f6f8b;
+    color: #ffffff;
+}
+
+QListWidget::indicator {
+    width: 14px;
+    height: 14px;
+    border: 1px solid #4a5b6e;
+    border-radius: 3px;
+    background-color: #12161c;
+}
+
+QListWidget::indicator:hover {
+    border: 1px solid #22d3ee;
+}
+
+QListWidget::indicator:checked {
+    background-color: #22d3ee;
+    border: 1px solid #22d3ee;
+}
+
+/* ----------------------------------------------------- text / log panels --- */
+/* No font-family here on purpose - see the header note. */
+QTextEdit,
+QPlainTextEdit {
+    background-color: #0f1319;
+    color: #cfe8ef;
+    border: 1px solid #263140;
+    border-radius: 8px;
+    padding: 6px;
+    selection-background-color: #1f6f8b;
+    selection-color: #ffffff;
+}
+
+/* --------------------------------------------------------- scroll bars ---- */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 0;
+}
+
+QScrollBar::handle:vertical {
+    background: #2c3a49;
+    border-radius: 5px;
+    min-height: 26px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #22d3ee;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 0;
+}
+
+QScrollBar::handle:horizontal {
+    background: #2c3a49;
+    border-radius: 5px;
+    min-width: 26px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: #22d3ee;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0;
+}
+
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background: transparent;
+}
+
+/* ------------------------------------------------- spin box / check box --- */
+/* The parameter pane (tab 1, bottom right) is built in code in buildParamPane().
+   Fonts: only per-class sizes below, never a global QWidget font - see the
+   header note (the result list's monospace font comes from setFont()). */
+QSpinBox,
+QDoubleSpinBox {
+    background-color: #12161c;
+    color: #dbe4ee;
+    border: 1px solid #263140;
+    border-radius: 4px;
+    padding: 2px 4px;
+    min-height: 18px;
+    selection-background-color: #1f6f8b;
+    selection-color: #ffffff;
+}
+
+QSpinBox:hover,
+QDoubleSpinBox:hover {
+    border: 1px solid #3d5064;
+}
+
+QSpinBox:focus,
+QDoubleSpinBox:focus {
+    border: 1px solid #22d3ee;
+}
+
+QSpinBox:disabled,
+QDoubleSpinBox:disabled {
+    background-color: #171c23;
+    color: #55606e;
+    border: 1px solid #232a34;
+}
+
+/* Up/down arrows: keep them narrow and flat so the 96px field leaves room for
+   the number itself. */
+QSpinBox::up-button,
+QDoubleSpinBox::up-button,
+QSpinBox::down-button,
+QDoubleSpinBox::down-button {
+    background: transparent;
+    border: none;
+    width: 13px;
+}
+
+QSpinBox::up-button:hover,
+QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover,
+QDoubleSpinBox::down-button:hover {
+    background-color: #263140;
+    border-radius: 2px;
+}
+
+QCheckBox {
+    spacing: 6px;
+}
+
+QCheckBox:disabled {
+    color: #55606e;
+}
+
+/* Same look as QListWidget::indicator so the two checkbox rows read as one
+   family. */
+QCheckBox::indicator {
+    width: 14px;
+    height: 14px;
+    border: 1px solid #4a5b6e;
+    border-radius: 3px;
+    background-color: #12161c;
+}
+
+QCheckBox::indicator:hover {
+    border: 1px solid #22d3ee;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #22d3ee;
+    border: 1px solid #22d3ee;
+}
+
+QCheckBox::indicator:disabled {
+    background-color: #171c23;
+    border: 1px solid #232a34;
+}
+
+/* ------------------------------------------------------ parameter scroll --- */
+/* Borderless: the group-box cards provide the visual structure. The viewport
+   itself must NOT be given a background here - it is a separate child widget
+   and is turned transparent in code (buildParamPane) so the tab colour shows
+   through. A broad "QScrollArea > QWidget > QWidget" rule would also win over
+   QGroupBox's card colour (more type selectors = higher specificity) and turn
+   the whole pane flat black. */
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+
+/* Only the parameter container is made transparent, by object name - so this
+   rule cannot leak onto anything else. */
+QWidget#paramPane {
+    background: transparent;
+}
+
+/* -------------------------------------------------------------- dialogs --- */
+/* QMessageBox is a Qt widget and follows the stylesheet. QFileDialog on
+   Windows uses the native dialog and deliberately does not - that is a
+   platform limitation, not a bug in this theme. */
+QMessageBox {
+    background-color: #12161c;
+}
+
+QMessageBox QLabel {
+    color: #dbe4ee;
+}
+
+/* --------------------------------------------------- VTK viewport chrome --- */
+/* Deliberately NOT styled. The VTK render window fills the QVTKWidget, so a
+   Qt-drawn border is invisible anyway - and putting a stylesheet on a widget
+   that hosts a native/OpenGL child window is a classic source of Qt/VTK paint
+   complaints. Leave these widgets entirely to VTK. */
