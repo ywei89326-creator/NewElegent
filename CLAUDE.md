@@ -152,6 +152,16 @@ repo root; the in-app tooltips carry the same conclusions in condensed form.
   恢复默认 resets only visible keys, 载入参数… ignores advanced keys from the file, and
   【收起高级参数】 discards unapplied advanced edits. New parameters default to advanced; add the
   key to `kBasic` to expose one. See `参数说明.md` §1.5.
+- **Camera calibration profiles** (【相机参数…】 in the top bar): the dialog accepts a 3×3 K (or
+  `fx, fy, cx, cy`), 4/5/8/12/14 distortion coefficients, clipboard paste/copy, and saves named
+  profiles to `<exe>/cameras.ini` (QSettings UTF-8 INI array). The last applied profile is reloaded at
+  startup (`loadActiveCameraProfile`). Applying calls `setCameraParameters`, re-undistorts the shown
+  image, clears results and forces re-detection. The factory K/D in `factoryCameraProfile()` mirror
+  the DLL constructor's defaults (the DLL exposes no getters) — keep them in sync. The active profile
+  cannot be deleted. **Scope: detection tab only** — it writes solely to `m_detector`; the
+  `MergeMarksLib` panel is a separate DLL with its own data path and never receives K/D. The button
+  lives inside `tabDetect`'s toolbar, and `onCameraParams()` also guards `m_tabs->currentIndex() == 0`.
+  See `参数说明.md` §14.
 
 #### ⚠ `TargetDetector.h` exists twice and the two copies must stay identical
 

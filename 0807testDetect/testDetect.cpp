@@ -20,6 +20,7 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDialog>
@@ -49,7 +50,9 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPlainTextEdit>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScrollArea>
 #include <QSet>
 #include <QSettings>
@@ -118,6 +121,110 @@ double polygonArea(const QPolygonF& poly)
     return std::fabs(a) * 0.5;
 }
 
+// ---------------------------------------------------------------- 相机标定工具
+
+// 从任意文本里提取所有浮点数: 兼容 "[[fx,0,cx],[0,fy,cy],[0,0,1]]"、
+// 逗号/空格/换行分隔的列表, 也兼容从 MATLAB/Python 复制出来的矩阵。
+QVector<double> parseNumberList(const QString& text)
+{
+    static const QRegularExpression re(
+        QStringLiteral(R"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)"));
+    QVector<double> out;
+    auto it = re.globalMatch(text);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        bool ok = false;
+        const double v = m.captured(0).toDouble(&ok);
+        if (ok && std::isfinite(v))
+            out.push_back(v);
+    }
+    return out;
+}
+
+// OpenCV initUndistortRectifyMap 接受 4/5/8/12/14 个畸变系数。
+bool validDistortionCount(int n)
+{
+    return n == 4 || n == 5 || n == 8 || n == 12 || n == 14;
+}
+
+QString formatK(const double k[9])
+{
+    QStringList rows;
+    for (int r = 0; r < 3; ++r) {
+        QStringList cols;
+        for (int c = 0; c < 3; ++c)
+            cols << QString::number(k[r * 3 + c], 'g', 12);
+        rows << cols.join(QLatin1Char(' '));
+    }
+    return rows.join(QLatin1Char('\n'));
+}
+
+QString formatD(const QVector<double>& d)
+{
+    QStringList vals;
+    for (double v : d)
+        vals << QString::number(v, 'g', 12);
+    return vals.join(QStringLiteral(", "));
+}
+
+// 解析 + 校验。空畸变按“无畸变”(5 个 0)处理。
+bool parseCameraText(const QString& kText, const QString& dText,
+    double kOut[9], QVector<double>& dOut, QString& err)
+{
+    const QVector<double> kn = parseNumberList(kText);
+    if (kn.size() == 4) {
+        // 常见简写: fx, fy, cx, cy
+        kOut[0] = kn[0]; kOut[1] = 0.0;   kOut[2] = kn[2];
+        kOut[3] = 0.0;   kOut[4] = kn[1]; kOut[5] = kn[3];
+        kOut[6] = 0.0;   kOut[7] = 0.0;   kOut[8] = 1.0;
+    }
+    else if (kn.size() == 9) {
+        for (int i = 0; i < 9; ++i)
+            kOut[i] = kn[i];
+    }
+    else {
+        err = QStringLiteral("内参需要 9 个数（3×3），或 4 个数（fx, fy, cx, cy）；"
+                             "当前 %1 个。").arg(kn.size());
+        return false;
+    }
+
+    if (std::fabs(kOut[6]) > 1e-6 || std::fabs(kOut[7]) > 1e-6 ||
+        std::fabs(kOut[8] - 1.0) > 1e-6) {
+        err = QStringLiteral("内参最后一行应为 0 0 1。");
+        return false;
+    }
+    if (std::fabs(kOut[0]) < 1e-12 || std::fabs(kOut[4]) < 1e-12) {
+        err = QStringLiteral("内参的 fx / fy 不能为 0。");
+        return false;
+    }
+
+    dOut = parseNumberList(dText);
+    if (dOut.isEmpty())
+        dOut = QVector<double>{ 0, 0, 0, 0, 0 };
+    else if (!validDistortionCount(dOut.size())) {
+        err = QStringLiteral("畸变系数需要 4/5/8/12/14 个数（当前 %1 个）。")
+                  .arg(dOut.size());
+        return false;
+    }
+    return true;
+}
+
+// 与 TargetDetector.cpp 构造函数里的出厂内参保持一致。
+CameraProfile factoryCameraProfile()
+{
+    CameraProfile p;
+    p.name = QStringLiteral("出厂默认");
+    const double k[9] = {
+        6633.54, 0.0, 1544.94,
+        0.0, 6633.48, 1091.96,
+        0.0, 0.0, 1.0
+    };
+    for (int i = 0; i < 9; ++i)
+        p.K[i] = k[i];
+    p.D = QVector<double>{ 0.047895, -0.226498, 0.000347139, 0.000879732, 0.0 };
+    return p;
+}
+
 } // namespace
 
 
@@ -125,7 +232,9 @@ testDetect::testDetect(QWidget* parent)
     : QMainWindow(parent)
 {
     ui.setupUi(this);
+    initCameraDefaults();
     buildUi();
+    loadActiveCameraProfile();
 }
 
 testDetect::~testDetect()
@@ -177,6 +286,10 @@ void testDetect::buildUi()
     // —— 顶部按钮条 ——
     QHBoxLayout* bar = new QHBoxLayout();
     m_btnImport = new QPushButton(QStringLiteral("导入图片"), tabDetect);
+    m_btnCamera = new QPushButton(QStringLiteral("相机参数…"), tabDetect);
+    m_btnCamera->setToolTip(QStringLiteral(
+        "设置靶标识别页的相机内参与畸变参数（命名保存、支持复制粘贴）。\n"
+        "仅影响「靶标识别」页，不会作用于「点云拼接」页。"));
     m_btnDetect = new QPushButton(QStringLiteral("开始识别编码片"), tabDetect);
     // 复用同一套预处理与亚像素精化, 但不要求编码环、不解码。
     m_btnDetectMarkers = new QPushButton(QStringLiteral("识别标记点"), tabDetect);
@@ -191,6 +304,7 @@ void testDetect::buildUi()
     m_btnFullScreen = new QPushButton(QStringLiteral("全屏 F11"), tabDetect);
     m_btnFullScreen->setCheckable(true);
     bar->addWidget(m_btnImport);
+    bar->addWidget(m_btnCamera);
     bar->addWidget(m_btnDetect);
     bar->addWidget(m_btnDetectMarkers);
     bar->addWidget(m_btnRoi);
@@ -314,6 +428,7 @@ void testDetect::buildUi()
     connect(m_tabs, &QTabWidget::currentChanged, this, &testDetect::onTabChanged);
 
     connect(m_btnImport, &QPushButton::clicked, this, &testDetect::onImportImage);
+    connect(m_btnCamera, &QPushButton::clicked, this, &testDetect::onCameraParams);
     connect(m_btnDetect, &QPushButton::clicked, this, &testDetect::onStartDetect);
     connect(m_btnDetectMarkers, &QPushButton::clicked, this, &testDetect::onStartDetectMarkers);
     connect(m_btnRoi, &QPushButton::toggled, this, &testDetect::onToggleRoiMode);
@@ -352,6 +467,356 @@ void testDetect::buildUi()
     statusBar()->addPermanentWidget(m_zoomLabel);
 
     statusBar()->showMessage(QStringLiteral("请先导入图片"));
+}
+
+
+// ---------------------------------------------------------------- 相机标定
+
+void testDetect::initCameraDefaults()
+{
+    m_activeCamera = factoryCameraProfile();
+}
+
+void testDetect::updateCameraButtonTooltip()
+{
+    if (!m_btnCamera)
+        return;
+    m_btnCamera->setToolTip(QStringLiteral(
+        "设置靶标识别页的相机内参与畸变参数（命名保存、支持复制粘贴）。\n"
+        "仅影响「靶标识别」页，不会作用于「点云拼接」页。\n"
+        "当前生效：%1").arg(m_activeCamera.name));
+}
+
+QString testDetect::cameraConfigPath() const
+{
+    return QCoreApplication::applicationDirPath() + QStringLiteral("/cameras.ini");
+}
+
+bool testDetect::loadCameraProfiles(QVector<CameraProfile>& profiles, QString& activeName) const
+{
+    profiles.clear();
+    activeName.clear();
+
+    QSettings s(cameraConfigPath(), QSettings::IniFormat);
+    s.setIniCodec("UTF-8");
+    if (s.status() != QSettings::NoError)
+        return false;
+
+    activeName = s.value(QStringLiteral("activeCamera")).toString();
+    const int n = s.beginReadArray(QStringLiteral("cameraProfiles"));
+    for (int i = 0; i < n; ++i) {
+        s.setArrayIndex(i);
+        CameraProfile p;
+        p.name = s.value(QStringLiteral("name")).toString().trimmed();
+        const QVector<double> kn = parseNumberList(s.value(QStringLiteral("K")).toString());
+        const QVector<double> dn = parseNumberList(s.value(QStringLiteral("D")).toString());
+        if (p.name.isEmpty() || kn.size() != 9 || !validDistortionCount(dn.size()))
+            continue;
+        for (int j = 0; j < 9; ++j)
+            p.K[j] = kn[j];
+        p.D = dn;
+        profiles.push_back(p);
+    }
+    s.endArray();
+    return !profiles.isEmpty();
+}
+
+void testDetect::saveCameraProfiles(const QVector<CameraProfile>& profiles, const QString& activeName)
+{
+    QSettings s(cameraConfigPath(), QSettings::IniFormat);
+    s.setIniCodec("UTF-8");
+    s.beginWriteArray(QStringLiteral("cameraProfiles"), profiles.size());
+    for (int i = 0; i < profiles.size(); ++i) {
+        s.setArrayIndex(i);
+        s.setValue(QStringLiteral("name"), profiles[i].name);
+        QStringList kv;
+        for (double v : profiles[i].K)
+            kv << QString::number(v, 'g', 17);
+        s.setValue(QStringLiteral("K"), kv.join(QLatin1Char(',')));
+        QStringList dv;
+        for (double v : profiles[i].D)
+            dv << QString::number(v, 'g', 17);
+        s.setValue(QStringLiteral("D"), dv.join(QLatin1Char(',')));
+    }
+    s.endArray();
+    s.setValue(QStringLiteral("activeCamera"), activeName);
+    s.sync();
+    if (s.status() != QSettings::NoError) {
+        QMessageBox::warning(this, QStringLiteral("保存失败"),
+            QStringLiteral("无法写入相机配置文件：\n%1\n请检查目录写权限。")
+                .arg(cameraConfigPath()));
+    }
+}
+
+void testDetect::applyCameraProfile(const CameraProfile& p)
+{
+    cv::Mat K = (cv::Mat_<double>(3, 3) <<
+        p.K[0], p.K[1], p.K[2],
+        p.K[3], p.K[4], p.K[5],
+        p.K[6], p.K[7], p.K[8]);
+    cv::Mat D(1, p.D.size(), CV_64F);
+    for (int i = 0; i < p.D.size(); ++i)
+        D.at<double>(0, i) = p.D[i];
+
+    // 只写入靶标识别器; MergeMarks 面板(第二页)完全独立, 从不接收 K/D。
+    m_detector.setCameraParameters(K, D);
+    m_activeCamera = p;
+    updateCameraButtonTooltip();
+
+    if (!m_hasImage) {
+        statusBar()->showMessage(QStringLiteral("相机参数已应用：%1").arg(p.name));
+        return;
+    }
+
+    // 坐标系已经改变: 旧结果和旧显示图都作废, 重新去畸变并提示重新识别。
+    clearResults();
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const cv::Mat disp = m_detector.undistortImage(m_srcMat);
+    QApplication::restoreOverrideCursor();
+    showImage(disp);
+    m_btnRoi->setChecked(false);
+    statusBar()->showMessage(QStringLiteral("相机参数已应用：%1 —— 请重新识别").arg(p.name));
+}
+
+void testDetect::loadActiveCameraProfile()
+{
+    QVector<CameraProfile> profiles;
+    QString activeName;
+    loadCameraProfiles(profiles, activeName);
+
+    if (!activeName.isEmpty()) {
+        for (const CameraProfile& p : profiles) {
+            if (p.name == activeName) {
+                applyCameraProfile(p);
+                // 启动时没有图片, 恢复"请先导入图片"的提示。
+                statusBar()->showMessage(QStringLiteral("请先导入图片"));
+                return;
+            }
+        }
+    }
+    updateCameraButtonTooltip();
+}
+
+void testDetect::onCameraParams()
+{
+    if (m_busy)
+        return;
+    // 相机参数只服务于「靶标识别」页; 「点云拼接」页有自己的数据链路,
+    // 不读取内参/畸变。按钮本身也只存在于第一页, 这里是第二道保险。
+    if (m_tabs && m_tabs->currentIndex() != 0)
+        return;
+
+    QVector<CameraProfile> profiles;
+    QString activeName;
+    loadCameraProfiles(profiles, activeName);
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("相机内参与畸变参数"));
+    dlg.setMinimumWidth(600);
+
+    QVBoxLayout* lay = new QVBoxLayout(&dlg);
+    lay->setSpacing(8);
+
+    QLabel* intro = new QLabel(QStringLiteral(
+        "从标定软件复制内参和畸变系数，粘贴到下面即可。\n"
+        "内参可粘贴 3×3 矩阵，或 fx, fy, cx, cy 四个数。\n"
+        "畸变顺序：k1, k2, p1, p2, k3[, k4, k5, k6 ...]，与 OpenCV calibrateCamera 一致。\n"
+        "配置按名称保存，下次启动自动使用最后应用的那一份。\n"
+        "作用范围：仅「靶标识别」页的识别与叠加显示；「点云拼接」页不使用这些参数。"), &dlg);
+    intro->setWordWrap(true);
+    lay->addWidget(intro);
+
+    lay->addWidget(new QLabel(QStringLiteral("当前生效：%1").arg(m_activeCamera.name), &dlg));
+
+    // 已保存配置
+    QHBoxLayout* profRow = new QHBoxLayout();
+    profRow->addWidget(new QLabel(QStringLiteral("已保存配置："), &dlg));
+    QComboBox* combo = new QComboBox(&dlg);
+    combo->addItem(QStringLiteral("（新建配置）"));
+    for (const CameraProfile& p : profiles)
+        combo->addItem(p.name);
+    int activeIdx = 0;
+    for (int i = 0; i < profiles.size(); ++i) {
+        if (profiles[i].name == activeName) {
+            activeIdx = i + 1;
+            break;
+        }
+    }
+    combo->setCurrentIndex(activeIdx);
+    profRow->addWidget(combo, 1);
+    QPushButton* btnLoad = new QPushButton(QStringLiteral("载入"), &dlg);
+    QPushButton* btnDel = new QPushButton(QStringLiteral("删除"), &dlg);
+    profRow->addWidget(btnLoad);
+    profRow->addWidget(btnDel);
+    lay->addLayout(profRow);
+
+    // 配置名称
+    QHBoxLayout* nameRow = new QHBoxLayout();
+    nameRow->addWidget(new QLabel(QStringLiteral("配置名称："), &dlg));
+    QLineEdit* nameEdit = new QLineEdit(&dlg);
+    nameEdit->setPlaceholderText(QStringLiteral("例如：2026-10-20 大华 2MP"));
+    nameEdit->setText(activeName.isEmpty()
+        ? QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd"))
+              + QStringLiteral(" 相机")
+        : m_activeCamera.name);
+    nameRow->addWidget(nameEdit, 1);
+    lay->addLayout(nameRow);
+
+    // 内参
+    lay->addWidget(new QLabel(QStringLiteral(
+        "内参矩阵 K（3×3，或 fx, fy, cx, cy；可粘贴带括号/逗号的文本）："), &dlg));
+    QPlainTextEdit* kEdit = new QPlainTextEdit(&dlg);
+    kEdit->setFixedHeight(78);
+    kEdit->setPlaceholderText(QStringLiteral(
+        "6633.54 0 1544.94\n0 6633.48 1091.96\n0 0 1"));
+    kEdit->setPlainText(formatK(m_activeCamera.K));
+    lay->addWidget(kEdit);
+
+    QHBoxLayout* kRow = new QHBoxLayout();
+    QPushButton* kPaste = new QPushButton(QStringLiteral("从剪贴板粘贴"), &dlg);
+    QPushButton* kCopy = new QPushButton(QStringLiteral("复制"), &dlg);
+    kRow->addWidget(kPaste);
+    kRow->addWidget(kCopy);
+    kRow->addStretch(1);
+    lay->addLayout(kRow);
+
+    // 畸变
+    lay->addWidget(new QLabel(QStringLiteral(
+        "畸变系数 D（k1, k2, p1, p2, k3 ...，留空 = 无畸变）："), &dlg));
+    QLineEdit* dEdit = new QLineEdit(&dlg);
+    dEdit->setPlaceholderText(QStringLiteral(
+        "0.047895, -0.226498, 0.000347139, 0.000879732, 0"));
+    dEdit->setText(formatD(m_activeCamera.D));
+    lay->addWidget(dEdit);
+
+    QHBoxLayout* dRow = new QHBoxLayout();
+    QPushButton* dPaste = new QPushButton(QStringLiteral("从剪贴板粘贴"), &dlg);
+    QPushButton* dCopy = new QPushButton(QStringLiteral("复制"), &dlg);
+    dRow->addWidget(dPaste);
+    dRow->addWidget(dCopy);
+    dRow->addStretch(1);
+    lay->addLayout(dRow);
+
+    QLabel* status = new QLabel(&dlg);
+    status->setWordWrap(true);
+    lay->addWidget(status);
+
+    QDialogButtonBox* bb = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    if (QPushButton* b = bb->button(QDialogButtonBox::Ok))
+        b->setText(QStringLiteral("应用并保存"));
+    if (QPushButton* b = bb->button(QDialogButtonBox::Cancel))
+        b->setText(QStringLiteral("取消"));
+    lay->addWidget(bb);
+
+    // 实时校验: 格式不对时禁用"应用并保存"。
+    auto validate = [&]() -> bool {
+        double k[9] = { 0 };
+        QVector<double> d;
+        QString err;
+        const bool ok = parseCameraText(kEdit->toPlainText(), dEdit->text(), k, d, err);
+        status->setText(ok
+            ? QStringLiteral("格式正确：fx=%1, fy=%2, cx=%3, cy=%4，畸变 %5 项")
+                  .arg(k[0], 0, 'g', 8).arg(k[4], 0, 'g', 8)
+                  .arg(k[2], 0, 'g', 8).arg(k[5], 0, 'g', 8)
+                  .arg(d.size())
+            : err);
+        status->setStyleSheet(ok ? QStringLiteral("color:#3aff8a;")
+                                 : QStringLiteral("color:#ffc35c;"));
+        if (QPushButton* b = bb->button(QDialogButtonBox::Ok))
+            b->setEnabled(ok);
+        return ok;
+    };
+
+    connect(kEdit, &QPlainTextEdit::textChanged, &dlg, [&]() { validate(); });
+    connect(dEdit, &QLineEdit::textChanged, &dlg, [&](const QString&) { validate(); });
+
+    connect(kPaste, &QPushButton::clicked, &dlg, [&]() {
+        kEdit->setPlainText(QApplication::clipboard()->text());
+    });
+    connect(kCopy, &QPushButton::clicked, &dlg, [&]() {
+        QApplication::clipboard()->setText(kEdit->toPlainText());
+    });
+    connect(dPaste, &QPushButton::clicked, &dlg, [&]() {
+        dEdit->setText(QApplication::clipboard()->text().trimmed());
+    });
+    connect(dCopy, &QPushButton::clicked, &dlg, [&]() {
+        QApplication::clipboard()->setText(dEdit->text());
+    });
+
+    connect(btnLoad, &QPushButton::clicked, &dlg, [&]() {
+        const int idx = combo->currentIndex() - 1;
+        if (idx < 0 || idx >= profiles.size())
+            return;
+        const CameraProfile& p = profiles[idx];
+        nameEdit->setText(p.name);
+        kEdit->setPlainText(formatK(p.K));
+        dEdit->setText(formatD(p.D));
+    });
+
+    connect(btnDel, &QPushButton::clicked, &dlg, [&]() {
+        const int idx = combo->currentIndex() - 1;
+        if (idx < 0 || idx >= profiles.size())
+            return;
+        if (profiles[idx].name == m_activeCamera.name) {
+            QMessageBox::information(&dlg, QStringLiteral("无法删除"),
+                QStringLiteral("这是当前生效的配置。请先应用另一份配置，再删除它。"));
+            return;
+        }
+        if (QMessageBox::question(&dlg, QStringLiteral("删除配置"),
+                QStringLiteral("确定删除配置“%1”吗？").arg(profiles[idx].name))
+            != QMessageBox::Yes)
+            return;
+        profiles.remove(idx);
+        saveCameraProfiles(profiles, activeName);
+        combo->clear();
+        combo->addItem(QStringLiteral("（新建配置）"));
+        for (const CameraProfile& p : profiles)
+            combo->addItem(p.name);
+        combo->setCurrentIndex(0);
+    });
+
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    connect(bb, &QDialogButtonBox::accepted, &dlg, [&]() {
+        double k[9] = { 0 };
+        QVector<double> d;
+        QString err;
+        if (!parseCameraText(kEdit->toPlainText(), dEdit->text(), k, d, err)) {
+            QMessageBox::warning(&dlg, QStringLiteral("格式错误"), err);
+            return;
+        }
+        const QString name = nameEdit->text().trimmed();
+        if (name.isEmpty()) {
+            QMessageBox::warning(&dlg, QStringLiteral("缺少名称"),
+                QStringLiteral("请给这份标定起一个名字，例如“2026-10-20 大华 2MP”。"));
+            return;
+        }
+
+        CameraProfile p;
+        p.name = name;
+        for (int i = 0; i < 9; ++i)
+            p.K[i] = k[i];
+        p.D = d;
+
+        // 同名更新，否则追加。
+        bool found = false;
+        for (CameraProfile& existing : profiles) {
+            if (existing.name == name) {
+                existing = p;
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            profiles.push_back(p);
+
+        saveCameraProfiles(profiles, name);
+        applyCameraProfile(p);
+        dlg.accept();
+    });
+
+    validate();
+    dlg.exec();
 }
 
 
@@ -1944,6 +2409,7 @@ void testDetect::setBusy(bool busy)
 {
     m_busy = busy;
     m_btnImport->setEnabled(!busy);
+    m_btnCamera->setEnabled(!busy);
     m_btnDetect->setEnabled(!busy && m_hasImage);
     m_btnDetectMarkers->setEnabled(!busy && m_hasImage);
     m_btnFit->setEnabled(!busy);

@@ -49,6 +49,14 @@ struct ParamField {
     std::function<void(DetectorParams&, double)> write;   // 数值 -> 参数集
 };
 
+// 一份命名保存的相机标定: 3x3 内参 + 畸变系数。
+// D 的长度允许 4/5/8/12/14, 顺序与 OpenCV calibrateCamera 一致。
+struct CameraProfile {
+    QString name;
+    double K[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    QVector<double> D = { 0, 0, 0, 0, 0 };
+};
+
 // 主窗口: 导入图片 → 识别 → 结果列表与叠加显示; 勾选结果可连成 ROI。
 // 右下角为识别参数面板(见 buildParamPane); 第二页为懒加载的点云拼接。
 class testDetect : public QMainWindow
@@ -65,6 +73,7 @@ protected:
 
 private slots:
     void onImportImage();
+    void onCameraParams();         // 相机内参/畸变设置(命名保存、复制粘贴)
     void onStartDetect();          // 识别编码片(原有行为)
     void onStartDetectMarkers();   // 识别普通标记点(编码片中心圆那种实心亮圆盘)
     void onToggleRoiMode(bool on);
@@ -146,6 +155,15 @@ private:
     void setAdvancedUnlocked(bool on);                    // 切换高级参数权限
     void applyParamVisibility();                          // 按权限显示/隐藏参数行与分组
 
+    // ---- 相机标定 ----
+    void initCameraDefaults();                            // 出厂默认(与 DLL 构造函数一致)
+    void loadActiveCameraProfile();                       // 启动时载入上次使用的配置
+    QString cameraConfigPath() const;                     // <exe>/cameras.ini
+    bool loadCameraProfiles(QVector<CameraProfile>& profiles, QString& activeName) const;
+    void saveCameraProfiles(const QVector<CameraProfile>& profiles, const QString& activeName);
+    void applyCameraProfile(const CameraProfile& p);      // 应用到识别器并刷新显示
+    void updateCameraButtonTooltip();
+
     QString paramsIniPath() const;
     void saveParamsIni();
     bool loadParamsIni();                                 // 返回 false = 没有可用的 ini
@@ -166,6 +184,7 @@ private:
 
     // 复用一个 detector: 去畸变映射表缓存在它里面, 导入时算一次识别时就不用再算
     TargetDetector m_detector{ nullptr };
+    CameraProfile m_activeCamera;    // 当前生效的标定(名称 + K + D)
     cv::Mat m_srcMat;                // 导入的原始图(未去畸变), 识别时喂给它
     bool m_hasImage = false;
     bool m_roiMode = false;          // 「开始画框」是否打开
@@ -222,6 +241,7 @@ private:
     FnMergeMarksDestroyPanel m_mmDestroy = nullptr;
     bool m_mmLoadTried = false;      // 失败过就不再反复重试
     QPushButton* m_btnImport = nullptr;
+    QPushButton* m_btnCamera = nullptr;    // 【相机参数…】
     QPushButton* m_btnDetect = nullptr;
     QPushButton* m_btnDetectMarkers = nullptr;
     QPushButton* m_btnRoi = nullptr;
