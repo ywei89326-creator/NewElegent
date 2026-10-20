@@ -16,6 +16,7 @@
 #include <QDir>
 #include <QFile>
 
+#include <QAction>
 #include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
@@ -39,6 +40,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QMenu>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
@@ -222,11 +224,25 @@ void testDetect::buildUi()
     m_listTitle = new QLabel(QStringLiteral("识别结果"), central);
     m_listTitle->setObjectName(QStringLiteral("sectionTitle"));   // 供 QSS 设强调色
 
+    // 标题行右侧: 按面积批量删除误识别的小圈, 无结果时禁用。
+    m_btnRemoveNoise = new QPushButton(QStringLiteral("删除干扰点"), central);
+    m_btnRemoveNoise->setToolTip(QStringLiteral(
+        "按轮廓面积批量删除误识别的小圈。\n"
+        "点击后输入面积阈值, 轮廓面积低于该值的识别结果全部删除。"));
+    m_btnRemoveNoise->setEnabled(false);
+
+    QHBoxLayout* listHeader = new QHBoxLayout();
+    listHeader->setContentsMargins(0, 0, 0, 0);
+    listHeader->setSpacing(6);
+    listHeader->addWidget(m_listTitle);
+    listHeader->addStretch(1);
+    listHeader->addWidget(m_btnRemoveNoise);
+
     QWidget* resultPane = new QWidget(central);
     QVBoxLayout* rl = new QVBoxLayout(resultPane);
     rl->setContentsMargins(0, 0, 0, 0);
     rl->setSpacing(4);
-    rl->addWidget(m_listTitle);
+    rl->addLayout(listHeader);
     rl->addWidget(m_list, 1);
 
     // —— 右下: 参数设置 ——
@@ -280,6 +296,10 @@ void testDetect::buildUi()
     connect(m_btnFit, &QPushButton::clicked, this, &testDetect::onFitView);
     connect(m_list, &QListWidget::itemChanged, this, &testDetect::onItemChanged);
     connect(m_list, &QListWidget::itemClicked, this, &testDetect::onItemClicked);
+    connect(m_btnRemoveNoise, &QPushButton::clicked, this, &testDetect::onRemoveNoise);
+    m_list->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_list, &QListWidget::customContextMenuRequested,
+        this, &testDetect::onListContextMenu);
 
     // —— 全屏 ——
     connect(m_btnFullScreen, &QPushButton::clicked, this, &testDetect::onToggleFullScreen);
@@ -1222,6 +1242,14 @@ void testDetect::finishDetect(const std::vector<DetectionResult>& results)
         mk.isMarker = m_markerMode;
         mk.pos = QPointF(r.center.x, r.center.y);
         mk.subpixel = r.subpixel;
+        // 面积取实际绘制的轮廓: 有拟合椭圆用椭圆面积, 否则用圆面积。
+        if (r.hasEllipse && r.ellipse.size.width > 0 && r.ellipse.size.height > 0) {
+            mk.area = CV_PI * (r.ellipse.size.width * 0.5) * (r.ellipse.size.height * 0.5);
+        }
+        else {
+            const double rr = qMax((double)r.radius, 1.0);
+            mk.area = CV_PI * rr * rr;
+        }
 
         // 优先画亚像素椭圆, 退化时按圆。
         mk.contour = new QGraphicsPathItem();
@@ -1255,12 +1283,15 @@ void testDetect::finishDetect(const std::vector<DetectionResult>& results)
             .arg(mk.id)
             .arg(mk.pos.x(), 0, 'f', 3)
             .arg(mk.pos.y(), 0, 'f', 3);
+        // 面积紧跟坐标: 列表宽度有限, 放在质量信息后面容易被省略号截掉。
+        text += QStringLiteral("面积 %1平方像素   ").arg(mk.area, 0, 'f', 1);
         if (r.subpixel)
             text += QStringLiteral("±%1px / %2pt").arg(r.rms, 0, 'f', 3).arg(r.nPoints);
         else
             text += QStringLiteral("(!)非亚像素");
 
         QListWidgetItem* item = new QListWidgetItem(text, m_list);
+        item->setToolTip(text);             // 列宽不足被省略时, 悬停可看全
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
         item->setCheckState(Qt::Unchecked);
         item->setData(Qt::UserRole, (int)i);        // 关联 m_markers 下标
@@ -1269,8 +1300,9 @@ void testDetect::finishDetect(const std::vector<DetectionResult>& results)
     }
     m_updatingList = false;
 
-    m_listTitle->setText((m_markerMode ? QStringLiteral("标记点结果 (%1)")
-                                       : QStringLiteral("识别结果 (%1)")).arg(results.size()));
+    updateResultTitle();
+    if (m_btnRemoveNoise)
+        m_btnRemoveNoise->setEnabled(!m_markers.isEmpty());
 
     applyHighlights();
     setBusy(false);
@@ -1298,6 +1330,114 @@ void testDetect::finishDetect(const std::vector<DetectionResult>& results)
                 .arg((int)results.size() - nSub);
         statusBar()->showMessage(msg);
     }
+}
+
+void testDetect::updateResultTitle()
+{
+    if (!m_listTitle)
+        return;
+    m_listTitle->setText((m_markerMode ? QStringLiteral("标记点结果 (%1)")
+                                       : QStringLiteral("识别结果 (%1)"))
+                             .arg(m_markers.size()));
+}
+
+// 行号与 m_markers 下标一一对应。从大到小删除, 前面行的下标不会失效。
+int testDetect::removeMarkerRows(QVector<int> rows)
+{
+    if (rows.isEmpty() || m_markers.isEmpty())
+        return 0;
+
+    std::sort(rows.begin(), rows.end(), std::greater<int>());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+
+    int removed = 0;
+    m_updatingList = true;
+    for (int row : rows) {
+        if (row < 0 || row >= m_markers.size() || row >= m_list->count())
+            continue;
+
+        delete m_markers[row].contour;   // 析构时自动从 scene 摘除
+        delete m_markers[row].dot;
+        delete m_markers[row].label;
+        m_markers.remove(row);
+        delete m_list->takeItem(row);
+
+        // 保持"列表行号 == m_markers 下标"的不变量。
+        for (int r = row; r < m_list->count(); ++r)
+            m_list->item(r)->setData(Qt::UserRole, r);
+        ++removed;
+    }
+    m_updatingList = false;
+
+    m_pressedItem = nullptr;
+    // 结果被删空时退出画框模式, 并同步依赖结果的按钮状态。
+    if (m_btnRoi) {
+        if (m_markers.isEmpty() && m_roiMode)
+            m_btnRoi->setChecked(false);
+        m_btnRoi->setEnabled(!m_markers.isEmpty());
+    }
+    if (m_btnClear)
+        m_btnClear->setEnabled(!m_markers.isEmpty());
+    if (m_btnRemoveNoise)
+        m_btnRemoveNoise->setEnabled(!m_markers.isEmpty());
+    updateResultTitle();
+    applyHighlights();
+    return removed;
+}
+
+void testDetect::onListContextMenu(const QPoint& pos)
+{
+    if (m_busy)
+        return;
+    QListWidgetItem* item = m_list->itemAt(pos);
+    if (!item)
+        return;
+
+    QMenu menu(this);
+    QAction* actRemove = menu.addAction(QStringLiteral("删除该结果"));
+    if (menu.exec(m_list->viewport()->mapToGlobal(pos)) != actRemove)
+        return;
+
+    const int row = m_list->row(item);
+    if (removeMarkerRows(QVector<int>{ row }) > 0)
+        statusBar()->showMessage(QStringLiteral("已删除 1 个识别结果"));
+}
+
+void testDetect::onRemoveNoise()
+{
+    if (m_busy || m_markers.isEmpty())
+        return;
+
+    // 默认阈值取面积中位数的一半, 通常落在真靶标与误识别小圈之间。
+    QVector<double> areas;
+    areas.reserve(m_markers.size());
+    for (const Marker& mk : m_markers)
+        areas.push_back(mk.area);
+    std::sort(areas.begin(), areas.end());
+    const double median = areas[areas.size() / 2];
+    const double suggested = qMax(0.0, std::round(median * 0.5 * 10.0) / 10.0);
+
+    bool ok = false;
+    const double thr = QInputDialog::getDouble(this, QStringLiteral("删除干扰点"),
+        QStringLiteral("轮廓面积小于该值的识别结果将被删除（单位：平方像素）。\n"
+                       "默认值为当前面积中位数的一半，可按列表里的面积调整："),
+        suggested, 0.0, 1.0e9, 1, &ok);
+    if (!ok)
+        return;
+
+    QVector<int> rows;
+    for (int i = 0; i < m_markers.size(); ++i) {
+        if (m_markers[i].area < thr)
+            rows.push_back(i);
+    }
+    if (rows.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("没有面积小于 %1平方像素 的结果").arg(thr, 0, 'f', 1));
+        return;
+    }
+
+    const int n = removeMarkerRows(rows);
+    statusBar()->showMessage(QStringLiteral("已删除 %1 个干扰点（轮廓面积 < %2平方像素）")
+        .arg(n).arg(thr, 0, 'f', 1));
 }
 
 
@@ -1542,6 +1682,8 @@ void testDetect::clearResults()
         m_roiItem->setPolygon(QPolygonF());
         m_roiItem->setVisible(false);
     }
+    if (m_btnRemoveNoise)
+        m_btnRemoveNoise->setEnabled(false);
     if (m_listTitle)
         m_listTitle->setText(QStringLiteral("识别结果"));
 }
@@ -1555,6 +1697,8 @@ void testDetect::setBusy(bool busy)
     m_btnFit->setEnabled(!busy);
     m_btnRoi->setEnabled(!busy && !m_markers.isEmpty());
     m_btnClear->setEnabled(!busy && !m_markers.isEmpty());
+    if (m_btnRemoveNoise)
+        m_btnRemoveNoise->setEnabled(!busy && !m_markers.isEmpty());
     // 识别期间禁用整栏: 参数本身有快照保护, 但禁掉可避免"本次用的哪套参数"说不清。
     if (m_paramPane)
         m_paramPane->setEnabled(!busy);

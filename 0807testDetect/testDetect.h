@@ -70,6 +70,8 @@ private slots:
     void onToggleRoiMode(bool on);
     void onItemChanged(QListWidgetItem* item);
     void onItemClicked(QListWidgetItem* item);
+    void onListContextMenu(const QPoint& pos);   // 右键删除单个结果
+    void onRemoveNoise();                        // 按轮廓面积批量删除干扰点
     void onClearSelection();
     void onFitView();
     void onTabChanged(int index);
@@ -87,6 +89,7 @@ private:
         int id = -1;
         bool isMarker = false;                  // true = 标记点模式(标签显示 M1..Mn, id 是序号)
         QPointF pos;
+        double area = 0.0;                      // 轮廓面积(拟合椭圆/圆), px²
         bool subpixel = true;                   // false = 中心退回了整数轮廓, 不是亚像素的
         QGraphicsPathItem* contour = nullptr;   // 亚像素拟合轮廓(倾斜时是椭圆)
         QGraphicsEllipseItem* dot = nullptr;    // 亚像素中心点
@@ -99,8 +102,11 @@ private:
     void finishDetect(const std::vector<DetectionResult>& results);
     void applyHighlights();
     void updateRoiStatus();
+    void updateResultTitle();                             // 标题里的结果计数
     void updateZoomLabel();
     void setBusy(bool busy);
+    // 按列表行号删除结果(行号与 m_markers 下标一一对应), 同步删除图元并重排索引。
+    int removeMarkerRows(QVector<int> rows);
 
     // ---- 参数设置栏 ----
     void buildParamPane(QWidget* paramPane);
@@ -155,6 +161,7 @@ private:
     QGraphicsPolygonItem* m_roiItem = nullptr;
     QListWidget* m_list = nullptr;
     QLabel* m_listTitle = nullptr;
+    QPushButton* m_btnRemoveNoise = nullptr;   // 【删除干扰点】按面积阈值批量删除
     QLabel* m_zoomLabel = nullptr;   // 状态栏右侧常驻的缩放比例
 
     // ---- 参数设置栏 ----
