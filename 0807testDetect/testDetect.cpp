@@ -1,4 +1,7 @@
 ﻿
+// windows.h 必须先于 testDetect.h(后者间接引入 OpenCV):
+// NOMINMAX 防止 min/max 宏破坏 std::min/std::max,
+// 并避免 winnt.h 与 OpenCV 各自定义的 ACCESS_MASK 冲突。
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -56,10 +59,9 @@
 namespace {
 
 
-// fontPx 是**屏幕像素**字号 —— 标签图元带 ItemIgnoresTransformations(见 finishDetect)
-// 尺寸不随视图缩放变化, 所以放大看亚像素轮廓时标签不会膨胀成一块招牌挡住画面。
-// 开头的 <br> 把文字压到锚点下方一行, 免得正好盖住要观察的轮
-// marker=true 时显示 M1/M2...(标记点没有编码 ID, id 只是本次结果里的序号), 否则沿用 ID:n
+// 结果标签 HTML。marker=true 显示 M1..Mn(标记点无编码 ID), 否则显示 ID:n。
+// fontPx 为屏幕像素: 标签图元忽略视图变换, 字号不随缩放变化。
+// 开头的 <br> 让文字落在锚点下方, 避免遮住轮廓。
 QString idLabelHtml(int id, bool highlight, double fontPx, bool marker = false)
 {
     const QString bg = highlight ? QStringLiteral("rgba(216,40,40,235)")
@@ -74,17 +76,14 @@ QString idLabelHtml(int id, bool highlight, double fontPx, bool marker = false)
         .arg(bg, fg, QString::number(fontPx, 'f', 0), tag);
 }
 
-// 亚像素轮廓路径。故意**不采样成多边形** —— 折线在放大几十倍后能看出棱角, 而 QPainterPath
-// 的圆弧段做仿射变换后仍是平滑曲线, 放到多大都不会有折线感。
-// (圆是用 4 段三次贝塞尔近似的, 半径 11px 时最大径向误差约 0.003px, 远小于这里的亚像素量级。)
+// 亚像素轮廓路径。用圆弧段而非折线, 放大后不会出现棱角。
+// 变换按 OpenCV RotatedRect 约定构造: QTransform(m11, m12, m21, m22, dx, dy)。
 QPainterPath contourPath(const cv::RotatedRect& e)
 {
     QPainterPath unit;
     unit.addEllipse(QPointF(0.0, 0.0), 1.0, 1.0);
 
-    // 按 OpenCV RotatedRect 的约定: 点 = R(θ) · S(a, b) · (cos t, sin t),
-    // 与 DLL 内部 cv::ellipse 画出来的方向一致, 不会镜像或差 90°。
-    // QTransform 的构造参数顺序是 (m11, m12, m21, m22, dx, dy)。
+    // 与 cv::ellipse 方向一致, 不会镜像或差 90°。
     const double th = e.angle * CV_PI / 180.0;
     const double ct = std::cos(th), st = std::sin(th);
     const double a = e.size.width * 0.5, b = e.size.height * 0.5;
@@ -98,7 +97,7 @@ QPainterPath contourPath(const cv::Point2f& c, double r)
     return p;
 }
 
-// 多边形面积(鞋带公式), 单位是图像像素
+// 多边形面积(鞋带公式), 单位: 平方像素。
 double polygonArea(const QPolygonF& poly)
 {
     const int n = poly.size();
@@ -124,34 +123,21 @@ testDetect::testDetect(QWidget* parent)
 
 testDetect::~testDetect()
 {
-    // 识别线程还在跑的话等它结束: 回调是打到 this 上的, 对象析构后再回调就是悬空指针
+    // 等待识别线程结束: 回调目标是 this, 析构后回调即悬空指针。
     if (m_thread && m_thread->isRunning())
         m_thread->wait();
 
-    // 第二页: 销毁面板(它背后是 MergeMarks1215 那个 QMainWindow)。
-    // 必须在 DLL 卸载之前 —— 面板里的 qvtkWidget 持有 PCL 建出来的 VTK 对象,
-    // DLL 一走这些就全成了悬空指针。
+    // 先销毁面板: 面板内的 qvtkWidget 持有 PCL 创建的 VTK 对象, DLL 不在时会悬空。
     if (m_mmPanel && m_mmDestroy) {
         m_mmDestroy(m_mmPanel);
         m_mmPanel = nullptr;
     }
 
- 
-    //
-    // FreeLibrary(MergeMarksLib.dll) 会让它的引用计数归零, 加载器随即连锁卸载它那一大批
-    // 依赖(pcl_*_debug.dll、vtk*_d.dll、vtkGUISupportQt-8.1_d.dll ...), 而 VTK 并不支持
-    // 在进程内被卸载: 各个 VTK DLL 里的 vtkObjectFactory 都注册在 vtkCommonCore 的全局
-    // 注册表里, 一旦卸载顺序错开, 那个注册表里就留下指向已卸载模块的悬空指针, 等
-    // vtkCommonCore 自己卸载时再去访问它, 就是 0xC0000005 —— 异常表现为"报在 FreeLibrary
-    // 这一行、位置在 vtkCommonCore-8.1_d.dll 里", 但根因是卸载 VTK 这件事本身不安全。
-    //
-    // 而且退出时卸载它没有任何收益: 进程马上就结束了, 省不下内存。
-    // m_mmModule 成员保留, 只是不再主动释放; 若将来确实需要中途卸载,
-    // 得先确认那一批 VTK/PCL 依赖没有任何别的引用者, 否则同样会崩。
-    // if (m_mmModule) {
-    //     ::FreeLibrary(static_cast<HMODULE>(m_mmModule));
-    //     m_mmModule = nullptr;
-    // }
+    // ⚠ 刻意不调用 FreeLibrary(m_mmModule):
+    // 它会连锁卸载 PCL/VTK 依赖, 而 VTK 不支持进程内卸载 —— vtkObjectFactory 注册表
+    // 会残留指向已卸载模块的指针, 表现为 vtkCommonCore 内 0xC0000005(报错行却在
+    // FreeLibrary 上, 极易误判)。进程即将退出, 交给系统回收即可。
+    // 详见 MergeMarksBridge.h。
 }
 
 
@@ -160,8 +146,7 @@ testDetect::~testDetect()
 void testDetect::buildUi()
 {
     setWindowTitle(QStringLiteral("标记点工具"));
-    // showMaximized() 之外还给一个最小尺寸: 再小右侧的参数栏就会窄到标签被截断,
-    // 图像视图也失去意义。resize() 的值是"用户取消最大化后的还原尺寸"。
+    // 再小右侧参数栏的标签会被截断, 图像视图也失去意义。
     setMinimumSize(1024, 680);
     resize(1280, 820);
 
@@ -170,8 +155,7 @@ void testDetect::buildUi()
     root->setContentsMargins(4, 4, 4, 4);
     root->setSpacing(0);
 
-    // 两个功能各占一个标签页: 第一页 = 靶标识别(原本的界面原封不动搬进来),
-    // 第二页 = 点云拼接(MergeMarks)。第二页是**懒加载**, 见 onTabChanged。
+    // 两页: 靶标识别(默认) / 点云拼接(懒加载, 见 onTabChanged)。
     m_tabs = new QTabWidget(central);
     root->addWidget(m_tabs);
 
@@ -184,7 +168,7 @@ void testDetect::buildUi()
     QHBoxLayout* bar = new QHBoxLayout();
     m_btnImport = new QPushButton(QStringLiteral("导入图片"), tabDetect);
     m_btnDetect = new QPushButton(QStringLiteral("开始识别编码片"), tabDetect);
-    // 标记点识别复用同一套预处理 + 亚像素精化, 只是不要求外围有编码环、也不解码。
+    // 复用同一套预处理与亚像素精化, 但不要求编码环、不解码。
     m_btnDetectMarkers = new QPushButton(QStringLiteral("识别标记点"), tabDetect);
     m_btnDetectMarkers->setToolTip(QStringLiteral(
         "识别普通圆形标记点（实心亮圆盘，即编码片中心圆）。\n"
@@ -193,7 +177,7 @@ void testDetect::buildUi()
     m_btnRoi->setCheckable(true);
     m_btnClear = new QPushButton(QStringLiteral("清空选择"), tabDetect);
     m_btnFit = new QPushButton(QStringLiteral("适应窗口"), tabDetect);
-    // 全屏按钮放在最右: 与 F11 同一条路径。勾选态 = 当前是否处于无边框全屏。
+    // 与 F11 同一路径; 勾选态 = 当前是否为无边框全屏。
     m_btnFullScreen = new QPushButton(QStringLiteral("全屏 F11"), tabDetect);
     m_btnFullScreen->setCheckable(true);
     bar->addWidget(m_btnImport);
@@ -207,17 +191,15 @@ void testDetect::buildUi()
     bar->addWidget(m_btnFullScreen);
     root1->addLayout(bar);
 
-    // —— 左: 最终识别结果画面 ——
+    // —— 左: 图像视图 ——
     m_scene = new QGraphicsScene(this);
     m_view = new QGraphicsView(m_scene, central);
     m_view->setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform);
     m_view->setDragMode(QGraphicsView::ScrollHandDrag);   // 左键拖拽平移
-    // 视口底色与主题一致(theme.qss 里的视口色 #1a2028)。必须在这里用代码设:
-    // QGraphicsView 的显式背景刷会压过样式表, QSS 里写 background 是无效的。
+    // 背景色必须在代码里设: 显式背景刷会压过 QSS(QSS 的 background 对其无效)。
     m_view->setBackgroundBrush(QBrush(QColor(0x1a, 0x20, 0x28)));
     m_view->setAlignment(Qt::AlignCenter);
-    // 滚轮缩放时以鼠标所指的位置为锚点, 而不是以视图中心
-    m_view->setTransformationAnchor(QGraphicsView::AnchorUnderMouse);
+    m_view->setTransformationAnchor(QGraphicsView::AnchorUnderMouse);   // 滚轮以光标为锚点
     m_view->viewport()->installEventFilter(this);   // resize / 滚轮缩放 / 双击
 
     // —— 右: 识别结果列表 ——
@@ -225,22 +207,20 @@ void testDetect::buildUi()
     m_list->setMinimumWidth(300);
     m_list->setAlternatingRowColors(true);
     m_list->setUniformItemSizes(true);
-    // 等宽字体: 坐标是变长小数, 比例字体下小数点对不齐, 一列数字看着是歪的
+    // 等宽字体: 坐标是变长小数, 比例字体下小数点对不齐。
     QFont mono(QStringLiteral("Consolas"));
     mono.setStyleHint(QFont::Monospace);
     mono.setPixelSize(13);
     m_list->setFont(mono);
-    // 用勾选框决定 ROI 顶点, 不用行选中: 行选中会自带一层高亮, 和"已选中要连框"混在一起看不清。
-    // 行不参与选中, 但**点行任意位置都等同于点勾选框**(见 onItemClicked), 不必去精准点那个小方框。
+    // 勾选框代表 ROI 顶点, 不用行选中(两层高亮会混淆)。
+    // 点行任意位置等同于点勾选框, 见 onItemClicked。
     m_list->setSelectionMode(QAbstractItemView::NoSelection);
-    // 必须用事件过滤器记录按下瞬间的勾选状态, 不能用 QListWidget::itemPressed:
-    // 点在勾选框上时 QStyledItemDelegate::editorEvent 会消费掉 MouseButtonPress,
-    // QAbstractItemView::mousePressEvent 提前 return, 那句 emit pressed 根本到不了。
+    // 必须用事件过滤器记录按下时的勾选态: 点在勾选框上时 delegate 会消费
+    // MouseButtonPress, QListWidget::itemPressed 不会触发。
     m_list->viewport()->installEventFilter(this);
 
     m_listTitle = new QLabel(QStringLiteral("识别结果"), central);
-    // 起个名字, 让 theme.qss 能把它做成强调色小标题(宿主控件都没设 objectName)
-    m_listTitle->setObjectName(QStringLiteral("sectionTitle"));
+    m_listTitle->setObjectName(QStringLiteral("sectionTitle"));   // 供 QSS 设强调色
 
     QWidget* resultPane = new QWidget(central);
     QVBoxLayout* rl = new QVBoxLayout(resultPane);
@@ -253,9 +233,8 @@ void testDetect::buildUi()
     QWidget* paramPane = new QWidget(central);
     buildParamPane(paramPane);
 
-    // 右侧竖向分成「识别结果」和「参数设置」两块。用垂直 splitter 而不是固定布局:
-    // 结果条数 0~30+ 与参数栏高度需求互相挤, 让用户自己拖比例最省事;
-    // childrenCollapsible=false 避免一不小心把某一块拖成 0 高度(参数就再也点不到了)。
+    // 右侧竖向分割: 结果列表与参数栏高度需求互相挤, 由用户拖动比例。
+    // childrenCollapsible=false 防止把某块拖成 0 高度后无法恢复。
     QSplitter* rightSplit = new QSplitter(Qt::Vertical, central);
     rightSplit->setChildrenCollapsible(false);
     rightSplit->addWidget(resultPane);
@@ -268,17 +247,17 @@ void testDetect::buildUi()
     QSplitter* split = new QSplitter(Qt::Horizontal, tabDetect);
     split->addWidget(m_view);
     split->addWidget(rightSplit);
-    split->setChildrenCollapsible(false);   // 图像视图/右侧栏都不许被拖没
+    split->setChildrenCollapsible(false);
     split->setStretchFactor(0, 3);
     split->setStretchFactor(1, 1);
     split->setSizes({ 900, 360 });
-    m_view->setMinimumWidth(360);           // 同理: 图像区也要留得住
+    m_view->setMinimumWidth(360);
     root1->addWidget(split, 1);
 
     m_tabs->addTab(tabDetect, QStringLiteral("靶标识别"));
 
     // —— 第二页: 点云拼接(MergeMarks) ——
-    // 占位控件先摆上, 真正的内容等第一次切到本页时再 LoadLibrary 出来(见 onTabChanged)。
+    // 先放占位控件, 首次切到本页时才 LoadLibrary(见 onTabChanged)。
     m_mergeMarksPage = new QWidget(m_tabs);
     QVBoxLayout* root2 = new QVBoxLayout(m_mergeMarksPage);
     root2->setContentsMargins(6, 6, 6, 6);
@@ -305,13 +284,12 @@ void testDetect::buildUi()
     // —— 全屏 ——
     connect(m_btnFullScreen, &QPushButton::clicked, this, &testDetect::onToggleFullScreen);
 
-    // 用 QShortcut 而不是重写 keyPressEvent: 快捷键在焦点控件之前处理, 所以焦点停在
-    // 某个数字框里时 F11 依然能到窗口(否则会被控件先吃掉, 时灵时不灵)。
+    // 用 QShortcut: 它在焦点控件之前处理, 焦点在数字框里时 F11 仍有效。
     QShortcut* scFull = new QShortcut(QKeySequence(Qt::Key_F11), this);
     scFull->setContext(Qt::WindowShortcut);
     connect(scFull, &QShortcut::activated, this, &testDetect::onToggleFullScreen);
 
-    // Esc 只在全屏时启用: 平时把 Esc 留给控件自己(例如数字框撤销输入)。
+    // Esc 仅全屏时启用, 平时留给控件(如数字框撤销输入)。
     m_shortcutEsc = new QShortcut(QKeySequence(Qt::Key_Escape), this);
     m_shortcutEsc->setContext(Qt::WindowShortcut);
     m_shortcutEsc->setEnabled(false);
@@ -322,7 +300,7 @@ void testDetect::buildUi()
     m_btnRoi->setEnabled(false);
     m_btnClear->setEnabled(false);
 
-    // 状态栏右侧常驻显示当前缩放倍数
+    // 状态栏右侧常驻缩放比例。
     m_zoomLabel = new QLabel(central);
     statusBar()->addPermanentWidget(m_zoomLabel);
 
@@ -331,22 +309,18 @@ void testDetect::buildUi()
 
 
 // ---------------------------------------------------------------- 参数设置栏
-//
-// 这一栏对应 schneider0807 里的 DetectorParams(TargetDetector.h)。文字说明写在
-// 工具提示里而非标签上: 标签短(≤6 字)才能在 340px 宽的栏里排下"标签 + 数字框"两列,
-// 否则标签换行会把行高撑得七零八落。
-//
-// 生效时机: 改控件 → 点【应用参数】→ 一次性 setParams 给识别器 + 落盘 settings.ini。
-// 之所以不做"边改边生效", 是因为识别一张 1200 万像素的图要若干秒, 拖动数字框时
-// 反复触发会把界面拖住; 而显式一步也让"现在屏幕上这些结果到底是哪套参数跑的"不含糊。
+// UI 映射 DetectorParams(TargetDetector.h)。标签用短名(≤6 字), 详细说明放 tooltip,
+// 否则 340px 宽会换行、行高失控。
+// 生效时机: 编辑 → 【应用参数】→ setParams + 写 settings.ini。
+// 不做实时生效: 单次识别需数秒, 拖动数字框会卡界面, 也说不清结果对应哪套参数。
 
 namespace {
 
-// 两个提示色, 与 theme.qss 里的次要文字色/警示色保持一致(样式表够不到动态状态, 只能代码里给)
+// 提示色, 与 theme.qss 的次要文字色/警示色一致(动态状态只能代码设色)。
 const char* const kHintColorIdle = "#8b9bb0";
 const char* const kHintColorDirty = "#ffc35c";
 
-// 建一个卡片式分组(QGroupBox 的底色/圆角由 theme.qss 统一给), 返回内部表单布局。
+// 建卡片式分组(QGroupBox 的底色/圆角由 theme.qss 提供), 返回内部表单布局。
 QGroupBox* makeParamGroup(QWidget* parent, const QString& title, QFormLayout** formOut)
 {
     QGroupBox* g = new QGroupBox(title, parent);
@@ -354,8 +328,7 @@ QGroupBox* makeParamGroup(QWidget* parent, const QString& title, QFormLayout** f
     f->setContentsMargins(8, 6, 8, 6);
     f->setSpacing(4);
     f->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    // 字段保持自然宽度并左对齐: 默认的 ExpandingFieldsGrow 会把数字框拉满整行,
-    // 窄栏里一行行看着像在"撑", 固定宽度反而更整齐也更好扫读。
+    // 字段保持自然宽度: 窄栏里拉伸填满会让数字框显得松散。
     f->setFieldGrowthPolicy(QFormLayout::FieldsStayAtSizeHint);
     f->setFormAlignment(Qt::AlignLeft | Qt::AlignTop);
     if (formOut)
@@ -363,7 +336,7 @@ QGroupBox* makeParamGroup(QWidget* parent, const QString& title, QFormLayout** f
     return g;
 }
 
-// 三种参数控件归一到 double, 于是 m_fields 上的所有操作都不必再区分控件类型。
+// 三种参数控件统一取值为 double, 上层无需区分类型。
 double widgetValue(const QWidget* w)
 {
     if (const QCheckBox* cb = qobject_cast<const QCheckBox*>(w))
@@ -386,12 +359,9 @@ void setWidgetValue(QWidget* w, double v)
 }
 
 // ---------------------------------------------------------------- 参数权限
-//
-// 两档参数:
-//   默认用户 —— 只看到「改了有明显效果、日常真的会动到」的少数几项;
-//   高级     —— 需要密码解锁, 包含几何比例、拟合内部量和整个解码/去重链路。
-// 判据放在 key 上而不是控件指针上, 这样三个 addXxxField 里都不必改调用点;
-// 新增参数时**默认落在高级侧**, 想让默认用户看到就把 key 加进 kBasic。
+// 默认用户只看到 kBasic 中的 8 项, 其余需密码解锁。
+// 按 key 判断而非控件指针, 三个 addXxxField 无需改动;
+// 新增参数默认归高级, 要开放给默认用户就把 key 加进 kBasic。
 bool isBasicParamKey(const QString& key)
 {
     static const QSet<QString> kBasic = {
@@ -407,10 +377,8 @@ bool isBasicParamKey(const QString& key)
     return kBasic.contains(key);
 }
 
-// 高级参数密码校验。源码里不保存明文, 只存密码 UTF-8 字节的 FNV-1a 64 位散列,
-// 用 strings 扫 exe 也扫不到。
-// ⚠ 这不是安全边界, 只是不让客户随手改到内部参数; 真要防住, 得把参数校验放到 DLL 里。
-// 换密码: 按同样的 FNV-1a 64(初始 0xcbf29ce484222325, 乘数 0x100000001b3)重算常量。
+// 密码校验: 只保存 FNV-1a 64 散列, 源码无明文。
+// ⚠ 这不是安全边界, 仅防止客户误改内部参数; 换密码时重算此常量。
 bool verifyAdvancedPassword(const QString& s)
 {
     quint64 h = 0xcbf29ce484222325ULL;
@@ -424,6 +392,8 @@ bool verifyAdvancedPassword(const QString& s)
 
 } // namespace
 
+// 三个 addXxxField 共用同一套逻辑: 建控件、写 tooltip、注册到 m_fields;
+// read/write 通过成员指针生成, 参数表里不必写字段名。
 QCheckBox* testDetect::addBoolField(QFormLayout* form, const QString& key, const QString& label,
     const QString& tip, bool DetectorParams::* member)
 {
@@ -448,8 +418,8 @@ QSpinBox* testDetect::addIntField(QFormLayout* form, const QString& key, const Q
 {
     QSpinBox* sb = new QSpinBox(form->parentWidget());
     sb->setRange(lo, hi);
-    sb->setAccelerated(true);            // 长按/滚轮可以加速
-    sb->setKeyboardTracking(false);      // 只在输入落定时发信号, 不要每敲一个键都算"改过了"
+    sb->setAccelerated(true);            // 滚轮/长按加速
+    sb->setKeyboardTracking(false);      // 输入落定才发信号, 避免每敲一键就算改动
     sb->setFixedWidth(96);
     sb->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     sb->setToolTip(tip);
@@ -474,8 +444,7 @@ QDoubleSpinBox* testDetect::addDoubleField(QFormLayout* form, const QString& key
     QDoubleSpinBox* dsb = new QDoubleSpinBox(form->parentWidget());
     dsb->setRange(lo, hi);
     dsb->setDecimals(decimals);
-    // 步长: 取"最小有效位"和"值域 1/200"里较大的那个 —— 小数位多的参数(如 0.0005)
-    // 用最小有效位刚好一格一格走, 而 0~10000 这种大范围则按 50 一格, 不然要按到手软。
+    // 步长取 max(最小有效位, 值域/200): 小量级可细调, 大范围不至于按到手软。
     dsb->setSingleStep(qMax(std::pow(10.0, -decimals), (hi - lo) / 200.0));
     dsb->setAccelerated(true);
     dsb->setKeyboardTracking(false);
@@ -509,19 +478,17 @@ void testDetect::buildParamPane(QWidget* paramPane)
     title->setObjectName(QStringLiteral("sectionTitle"));
     v->addWidget(title);
 
-    // 三十来个参数在 340px 宽的栏里必然超出一屏高度, 所以套一个滚动区:
-    // 这样窗口变矮时是"出现滚动条", 而不是把每一行压扁。
+    // 参数总高超过一屏: 用滚动区, 窗口变矮时出现滚动条而不是压扁行高。
     m_paramScroll = new QScrollArea(paramPane);
     m_paramScroll->setWidgetResizable(true);
     m_paramScroll->setFrameShape(QFrame::NoFrame);
     m_paramScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    // 视口不自己填背景, 让它透出页签底色。视口是滚动区的独立子控件, QSS 里给
-    // QScrollArea 写 background 改不到它 —— 同 CLAUDE.md 记的"部分颜色只能在代码里改"。
+    // 视口透明: 视口是独立子控件, 给 QScrollArea 写 background 改不到它。
     if (m_paramScroll->viewport())
         m_paramScroll->viewport()->setAutoFillBackground(false);
 
     QWidget* inner = new QWidget;
-    inner->setObjectName(QStringLiteral("paramPane"));   // 透明背景靠 QSS 的 ID 选择器给
+    inner->setObjectName(QStringLiteral("paramPane"));   // 供 QSS 的 ID 选择器设透明背景
     QVBoxLayout* il = new QVBoxLayout(inner);
     il->setContentsMargins(2, 2, 2, 2);
     il->setSpacing(8);
@@ -534,7 +501,7 @@ void testDetect::buildParamPane(QWidget* paramPane)
     il->addWidget(makeParamGroup(inner, QStringLiteral("轮廓筛选"), &fCirc));
     m_groupSubpixel = makeParamGroup(inner, QStringLiteral("亚像素精化"), &fSub);
     il->addWidget(m_groupSubpixel);
-    // 这两组整组都是高级参数: 锁定状态下整块隐藏, 避免留下空卡片。
+    // 这两组全部是高级参数, 锁定时整组隐藏。
     m_groupDecode = makeParamGroup(inner, QStringLiteral("解码与去重"), &fDec);
     il->addWidget(m_groupDecode);
 
@@ -735,14 +702,12 @@ void testDetect::buildParamPane(QWidget* paramPane)
                        "相邻很近的靶标被误合并时调小(5~8)。"),
         1.0, 1000.0, 1, &DetectorParams::minGapRadii);
 
-    // 分组之下留一点空白, 让最后一个卡片不贴边
     il->addStretch(1);
     m_paramScroll->setWidget(inner);
     v->addWidget(m_paramScroll, 1);
 
-    // ---- 按钮(2×2: 340px 宽的一栏里一行放不下 4 个中文按钮) ----
-    // 按钮和提示刻意放在滚动区**外面**, 固定在参数栏底部。【应用参数】是这一栏的主操作,
-    // 若跟着参数一起滚, 默认视图下正好落在屏幕外, 很容易让人以为压根没这个按钮。
+    // ---- 按钮(2×2: 340px 宽一行放不下 4 个中文按钮) ----
+    // 按钮固定在滚动区外: 【应用参数】是主操作, 不应随参数一起滚出屏幕。
     QGridLayout* btns = new QGridLayout();
     btns->setContentsMargins(0, 0, 0, 0);
     btns->setSpacing(6);
@@ -754,8 +719,7 @@ void testDetect::buildParamPane(QWidget* paramPane)
     btns->addWidget(m_btnResetParams, 0, 1);
     btns->addWidget(m_btnSaveParams, 1, 0);
     btns->addWidget(m_btnLoadParams, 1, 1);
-    // 高级参数入口。默认用户只会看到一个需要密码的按钮, 不知道密码就打不开
-    // 亚像素精化 / 解码与去重两组, 也看不到前两组里的高级项。
+    // 高级参数入口: 锁定时只显示此按钮, 密码正确才展开全部参数。
     m_btnUnlock = new QPushButton(QStringLiteral("高级参数…"), paramPane);
     m_btnUnlock->setToolTip(QStringLiteral("输入密码后显示全部 32 项参数。\n"
                                            "默认用户只需调上面那几项常用参数。"));
@@ -772,8 +736,7 @@ void testDetect::buildParamPane(QWidget* paramPane)
     connect(m_btnLoadParams, &QPushButton::clicked, this, &testDetect::onLoadParamsFile);
     connect(m_btnUnlock, &QPushButton::clicked, this, &testDetect::onUnlockAdvanced);
 
-    // 初值: 优先上次保存的 ini; 没有(或读不出来)就用出厂默认。
-    // 两条路都要把参数真正灌进识别器 —— 光填控件不改识别器, 界面上显示的和实际用的是两回事。
+    // 初值: settings.ini 优先, 否则出厂默认; 两条路都要同步到识别器。
     if (!loadParamsIni()) {
         const DetectorParams def = TargetDetector::defaultParams();
         loadParamsToWidgets(def);
@@ -781,12 +744,12 @@ void testDetect::buildParamPane(QWidget* paramPane)
     }
     setParamsDirty(false);
     updateParamDependents();
-    applyParamVisibility();      // 启动时是锁定状态: 只露出默认用户该看到的那几项
+    applyParamVisibility();      // 启动即锁定
 }
 
 DetectorParams testDetect::collectParams() const
 {
-    // 以默认值打底再逐项覆盖: 万一某个控件没建起来, 也不会把那一项变成 0。
+    // 默认值打底, 防止某个控件缺失时把该项写成 0。
     DetectorParams p = TargetDetector::defaultParams();
     for (const ParamField& f : m_fields) {
         if (!f.w)
@@ -798,7 +761,7 @@ DetectorParams testDetect::collectParams() const
 
 void testDetect::loadParamsToWidgets(const DetectorParams& p)
 {
-    m_updatingParams = true;      // 下面的 setValue/setChecked 会发信号, 别当成用户改动
+    m_updatingParams = true;      // setValue/setChecked 会发信号, 抑制"被改动"判定
     for (const ParamField& f : m_fields) {
         if (f.w)
             setWidgetValue(f.w, f.read(p));
@@ -810,8 +773,7 @@ void testDetect::onParamEdited()
 {
     if (m_updatingParams)
         return;
-    // 记住这次改动是否落在默认用户可见的项上: 收起高级参数时会丢弃高级项上
-    // 尚未应用的改动, 但常用项的改动必须保留, 提示状态也要据此重算。
+    // 记录改动是否包含常用项: 收起高级参数时只丢弃高级项上的未应用改动。
     if (QWidget* w = qobject_cast<QWidget*>(sender())) {
         for (const ParamField& f : m_fields) {
             if (f.w == w) {
@@ -822,7 +784,7 @@ void testDetect::onParamEdited()
         }
     }
     setParamsDirty(true);
-    updateParamDependents();      // 总开关一改, 被它压住的那几行要跟着变灰/变亮
+    updateParamDependents();      // 总开关变化后同步联动项的启用状态
 }
 
 void testDetect::setParamsDirty(bool dirty)
@@ -834,7 +796,7 @@ void testDetect::setParamsDirty(bool dirty)
         m_paramHint->setText(dirty
             ? QStringLiteral("参数已改动，点「应用参数」生效")
             : QStringLiteral("参数已生效；改动后需点「开始识别编码片」或「识别标记点」重新识别"));
-        // QSS 里没法表达"这个 label 现在处于未应用状态", 动态状态只能在代码里上色
+        // 动态状态无法用 QSS 选择器表达, 只能在代码里设色。
         m_paramHint->setStyleSheet(QStringLiteral("color:%1;")
             .arg(QLatin1String(dirty ? kHintColorDirty : kHintColorIdle)));
     }
@@ -844,8 +806,7 @@ void testDetect::setParamsDirty(bool dirty)
 
 void testDetect::updateParamDependents()
 {
-    // 关掉总开关之后, 被它压住的那几项就不再被算法读取了 —— 明确置灰,
-    // 免得用户对着一个不起作用的数字反复调(这是参数栏最容易让人误判的地方)。
+    // 总开关关掉后, 被它压住的项不再被算法读取, 置灰以免用户白调。
     if (m_chkOtsu && m_spinFixedThr)
         m_spinFixedThr->setEnabled(!m_chkOtsu->isChecked());
     if (m_chkOtsuK && m_spinFixedKt)
@@ -860,12 +821,9 @@ void testDetect::updateParamDependents()
 }
 
 // ---------------------------------------------------------------- 参数权限
-//
-// 默认用户只看到 kBasic 里那几项; 其余(含亚像素精化 / 解码与去重整两组)要密码才显示。
-// 锁定不只是"看不见", 还必须在数据层面挡住三条旁路:
-//   ① 载入参数文件时忽略高级键;
-//   ② 恢复默认时只重置可见项;
-//   ③ 收起时丢弃尚未应用的高级改动, 免得之后被默认用户的"应用"顺手带进去。
+// 锁定不只是隐藏控件, 还要在数据层挡住三条旁路:
+//   ① 载入参数文件时忽略高级键; ② 恢复默认只重置可见项;
+//   ③ 收起时丢弃高级项上未应用的改动, 避免之后被"应用参数"带进去。
 void testDetect::setAdvancedUnlocked(bool on)
 {
     if (m_advancedUnlocked == on)
@@ -873,7 +831,7 @@ void testDetect::setAdvancedUnlocked(bool on)
     m_advancedUnlocked = on;
 
     if (!on) {
-        // 收起 = 放弃未应用的高级改动, 回到识别器里真正在用的那套值。
+        // 收起 = 放弃未应用的高级改动, 恢复为识别器当前生效值。
         const DetectorParams cur = m_detector.params();
         m_updatingParams = true;
         for (const ParamField& f : m_fields) {
@@ -882,7 +840,7 @@ void testDetect::setAdvancedUnlocked(bool on)
         }
         m_updatingParams = false;
 
-        // 只保留常用项上的未应用改动; 高级项上刚被丢弃的改动不再算数。
+        // 只统计常用项上的未应用改动。
         setParamsDirty(m_basicDirty);
     }
 
@@ -891,7 +849,7 @@ void testDetect::setAdvancedUnlocked(bool on)
                                 : QStringLiteral("高级参数…"));
     }
     applyParamVisibility();
-    updateParamDependents();     // 解锁后才可见的亚像素组要按总开关重新算联动禁用
+    updateParamDependents();     // 解锁后的亚像素组要重新计算联动禁用
 
     statusBar()->showMessage(on
         ? QStringLiteral("高级参数已解锁 —— 修改后记得点「应用参数」")
@@ -900,14 +858,13 @@ void testDetect::setAdvancedUnlocked(bool on)
 
 void testDetect::applyParamVisibility()
 {
-    // 整组: 亚像素精化 / 解码与去重 的所有项都是高级参数
+    // 这两组全部是高级参数, 整组显隐。
     if (m_groupSubpixel)
         m_groupSubpixel->setVisible(m_advancedUnlocked);
     if (m_groupDecode)
         m_groupDecode->setVisible(m_advancedUnlocked);
 
-    // 单个字段: 高级项连同 QFormLayout 自动生成的标签一起隐藏。
-    // QFormLayout 会跳过空行, 所以锁定状态下不会留下一条条空白。
+    // 字段与其 QFormLayout 标签一起显隐; 空行会被布局跳过。
     for (const ParamField& f : m_fields) {
         if (!f.w)
             continue;
@@ -924,7 +881,7 @@ void testDetect::applyParamVisibility()
 
 void testDetect::onUnlockAdvanced()
 {
-    // 已解锁时点按钮只是收起, 不再要密码
+    // 已解锁时点按钮只是收起, 不再要密码。
     if (m_advancedUnlocked) {
         setAdvancedUnlocked(false);
         return;
@@ -947,15 +904,14 @@ void testDetect::onUnlockAdvanced()
 void testDetect::onApplyParams()
 {
     const DetectorParams wanted = collectParams();
-    m_detector.setParams(wanted);            // DLL 侧还会再夹一次范围(第二道防线)
-    // 回读识别器里真正生效的值再填回控件: setParams 可能夹取过(比如腐蚀核填了偶数),
-    // 这样界面显示的和实际用的一定一致, 不会出现"界面上是 4、算法里是 5"。
+    m_detector.setParams(wanted);            // DLL 侧还会再夹取一次范围
+    // 回读实际生效值, 保证界面与算法一致(例如腐蚀核填偶数会被夹成奇数)。
     loadParamsToWidgets(m_detector.params());
     updateParamDependents();
     saveParamsIni();
     setParamsDirty(false);
 
-    // 已经显示出来的结果是旧参数跑出来的, 必须说清楚, 否则很容易以为"改了没用"
+    // 现有结果由旧参数产生, 明确提示重新识别。
     statusBar()->showMessage(m_markers.isEmpty()
         ? QStringLiteral("参数已应用")
         : QStringLiteral("参数已应用 —— 点「开始识别编码片」或「识别标记点」用新参数重新识别"));
@@ -964,8 +920,7 @@ void testDetect::onApplyParams()
 void testDetect::onResetParams()
 {
     DetectorParams def = TargetDetector::defaultParams();
-    // 锁定状态下「恢复默认」只重置默认用户看得到的参数: 高级项沿用当前生效值。
-    // 否则这个按钮就成了绕过密码修改高级参数的入口。
+    // 锁定时只重置常用项, 否则可绕过密码修改高级参数。
     if (!m_advancedUnlocked) {
         const DetectorParams cur = m_detector.params();
         for (const ParamField& f : m_fields) {
@@ -976,7 +931,7 @@ void testDetect::onResetParams()
     loadParamsToWidgets(def);
     m_detector.setParams(def);
     updateParamDependents();
-    saveParamsIni();          // 默认值也落盘, 否则下次启动又会读回旧的那套
+    saveParamsIni();          // 默认值同样落盘, 否则下次启动会读回旧参数
     setParamsDirty(false);
     statusBar()->showMessage(m_advancedUnlocked
         ? QStringLiteral("参数已恢复默认并应用")
@@ -987,8 +942,7 @@ void testDetect::onResetParams()
 
 QString testDetect::paramsIniPath() const
 {
-    // 放在 exe 同目录: 这套参数是"这台机器上这个识别流程"的配置, 跟着程序走最直观,
-    // 也免得写注册表。x64\Debug 是可写的。
+    // 放在 exe 同目录, 跟随程序, 不写注册表。
     return QCoreApplication::applicationDirPath() + QStringLiteral("/settings.ini");
 }
 
@@ -998,9 +952,7 @@ void testDetect::writeParamsToSettings(const DetectorParams& p, const QVector<Pa
     QSettings s(filePath, QSettings::IniFormat);
     s.beginGroup(group);
     for (const ParamField& f : fields) {
-        // 用 17 位有效数字的字符串存 double: QVariant 默认的 double→文本转换只有 6 位
-        // 有效数字, 像 0.0005 这种小量级的参数会被截断到 0.0005 尚可, 但 0.03001
-        // 之类就会被抹平, 存回去的值和前一次应用的就不再是同一个数。
+        // 17 位有效数字: QVariant 默认 6 位会把 0.03001 之类的小量级抹平。
         s.setValue(f.key, QString::number(f.read(p), 'g', 17));
     }
     s.endGroup();
@@ -1022,7 +974,7 @@ bool testDetect::readParamsFromSettings(DetectorParams& p, const QVector<ParamFi
     s.beginGroup(group);
     for (const ParamField& f : fields) {
         if (!keys.contains(f.key))
-            continue;                 // ini 里缺的键保持 p 现有的值(调用方已用默认值打底)
+            continue;                 // 缺键保留 p 的现值(调用方已用默认值打底)
         bool ok = false;
         const double v = s.value(f.key).toString().toDouble(&ok);
         if (ok)
@@ -1055,7 +1007,7 @@ void testDetect::onSaveParamsFile()
         QStringLiteral("detectParams.ini"), QStringLiteral("参数文件 (*.ini)"));
     if (path.isEmpty())
         return;
-    // 存的是"当前控件里这套"而不是"已生效那套": 用户的直觉是"我现在看到的这份存下来"
+    // 保存控件中的当前值(含未应用改动), 所见即所存。
     writeParamsToSettings(collectParams(), m_fields, QStringLiteral("detectParams"), path);
     statusBar()->showMessage(QStringLiteral("参数已保存到 %1").arg(path));
 }
@@ -1073,8 +1025,7 @@ void testDetect::onLoadParamsFile()
             QStringLiteral("这个文件里没有可用的参数(期望 [detectParams] 分组):\n%1").arg(path));
         return;
     }
-    // 锁定状态下参数文件只对常用项生效: 高级键一律沿用当前生效值,
-    // 免得"载入一个 ini"成为绕过密码修改内部参数的入口。
+    // 锁定时忽略文件中的高级键, 沿用当前生效值, 防止绕过密码。
     if (!m_advancedUnlocked) {
         const DetectorParams cur = m_detector.params();
         for (const ParamField& f : m_fields) {
@@ -1086,7 +1037,7 @@ void testDetect::onLoadParamsFile()
     m_detector.setParams(p);
     loadParamsToWidgets(m_detector.params());
     updateParamDependents();
-    saveParamsIni();              // 载入即视为当前配置, 一并写进自动记住的那份
+    saveParamsIni();              // 载入即视为当前配置, 同步写入 settings.ini
     setParamsDirty(false);
     const QString name = QFileInfo(path).fileName();
     if (m_markers.isEmpty()) {
@@ -1107,7 +1058,7 @@ void testDetect::onToggleFullScreen()
     if (goFull)
         showFullScreen();
     else
-        showMaximized();      // 退出全屏退回最大化, 而不是普通窗口: 本程序默认就是最大化形态
+        showMaximized();      // 退出全屏回到最大化(本程序默认最大化)
 
     if (m_btnFullScreen)
         m_btnFullScreen->setChecked(goFull);
@@ -1153,7 +1104,7 @@ void testDetect::onImportImage()
     m_srcMat = raw;
     m_hasImage = true;
 
-    // 识别的 (x,y) 是去畸变坐标系下的, 显示图必须用同一坐标系, 否则叠加会整体偏移
+    // 识别坐标位于去畸变坐标系, 显示图必须同源, 否则叠加会整体偏移。
     QApplication::setOverrideCursor(Qt::WaitCursor);
     const cv::Mat disp = m_detector.undistortImage(m_srcMat);
     QApplication::restoreOverrideCursor();
@@ -1170,28 +1121,27 @@ void testDetect::onImportImage()
 
 void testDetect::showImage(const cv::Mat& bgr)
 {
-    m_scene->clear();               // 连同所有图元一起销毁, 下面重新建
+    m_scene->clear();               // 连同图元一起销毁
     m_markers.clear();
     m_pixmapItem = nullptr;
     m_roiItem = nullptr;
 
     cv::Mat rgb;
     cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
-    // QImage 不接管数据, 交给 QPixmap 前必须深拷贝一份
+    // QImage 不接管数据, 转 QPixmap 前必须深拷贝。
     const QImage img(rgb.data, rgb.cols, rgb.rows, (int)rgb.step, QImage::Format_RGB888);
     m_pixmapItem = m_scene->addPixmap(QPixmap::fromImage(img.copy()));
     m_pixmapItem->setZValue(0);
 
     m_scene->setSceneRect(m_pixmapItem->boundingRect());
 
-    // 图元尺寸跟着图像大小走, 高分辨率图上不会细成一根线
+    // 图元尺寸随图像分辨率缩放。
     const int shortSide = qMin(bgr.cols, bgr.rows);
     m_markRadius = qBound(5.0, shortSide / 180.0, 48.0);
     m_penW = qBound(1.0, shortSide / 900.0, 8.0);
-    // 标签字号是**屏幕像素**, 固定值: 标签图元忽略视图变换, 尺寸不随缩放变化
-    m_labelFontPx = 13.0;
+    m_labelFontPx = 13.0;         // 屏幕像素, 不随缩放变化
 
-    // ROI 多边形先建好(垫在圆点下面), 有 3 个点以上才显示
+    // ROI 多边形垫在标记点下面, 至少 3 点才显示。
     m_roiItem = m_scene->addPolygon(QPolygonF(),
         QPen(QColor(0, 220, 90), m_penW * 2.0), QBrush(QColor(0, 220, 90, 60)));
     m_roiItem->setZValue(1);
@@ -1209,15 +1159,15 @@ void testDetect::onStartDetect()
     if (!m_hasImage || m_busy)
         return;
 
-    m_markerMode = false;       // 编码片模式(结果列表/标签显示 ID:n)
+    m_markerMode = false;       // 编码片模式: 标签显示 ID:n
     clearResults();
     setBusy(true);
     statusBar()->showMessage(QStringLiteral("识别中…"));
 
-    cv::Mat input = m_srcMat;   // 浅拷贝, 与主线程共享像素, 线程里只读
+    cv::Mat input = m_srcMat;   // 浅拷贝共享像素, 工作线程只读
     m_thread = QThread::create([this, input]() mutable {
         const std::vector<DetectionResult> results = m_detector.detectTarget(input);
-        // 回到 GUI 线程再碰界面
+        // 切回 GUI 线程再更新界面
         QMetaObject::invokeMethod(this, [this, results]() { finishDetect(results); },
                                   Qt::QueuedConnection);
     });
@@ -1225,8 +1175,8 @@ void testDetect::onStartDetect()
     m_thread->start();
 }
 
-// 标记点识别: 与 onStartDetect 完全相同的线程/回包方式, 只是调用另一个 DLL 入口。
-// detectMarkers 不做解码, 所以结果里 id 恒为 -1; 序号由 finishDetect 按结果下标生成。
+// 与 onStartDetect 相同的线程模型, 调用 detectMarkers。
+// 不做解码, 结果 id 恒为 -1, 界面序号由 finishDetect 生成。
 void testDetect::onStartDetectMarkers()
 {
     if (!m_hasImage || m_busy)
@@ -1237,14 +1187,14 @@ void testDetect::onStartDetectMarkers()
     setBusy(true);
     statusBar()->showMessage(QStringLiteral("标记点识别中…"));
 
-    cv::Mat input = m_srcMat;   // 浅拷贝, 与主线程共享像素, 线程里只读
+    cv::Mat input = m_srcMat;   // 浅拷贝共享像素, 工作线程只读
     m_thread = QThread::create([this, input]() mutable {
         std::vector<DetectionResult> results;
         try {
             results = m_detector.detectMarkers(input);
         }
         catch (const std::exception& e) {
-            // 异常不能穿出 QThread 的线程函数(会 std::terminate), 也不能让界面永远 busy
+            // 异常不能穿出线程函数(会 std::terminate), 也不能让界面停在 busy。
             const QString msg = QString::fromLocal8Bit(e.what());
             QMetaObject::invokeMethod(this, [this, msg]() {
                 setBusy(false);
@@ -1267,13 +1217,13 @@ void testDetect::finishDetect(const std::vector<DetectionResult>& results)
         const DetectionResult& r = results[i];
 
         Marker mk;
-        // 标记点没有编码 ID(DLL 返回 id=-1), 这里用 1 起的序号做界面标识
+        // 标记点无编码 ID(DLL 返回 -1), 用 1 起的序号作为界面标识。
         mk.id = m_markerMode ? (int)i + 1 : (int)r.id;
         mk.isMarker = m_markerMode;
         mk.pos = QPointF(r.center.x, r.center.y);
         mk.subpixel = r.subpixel;
 
-        // 真实识别到的亚像素轮廓: 优先用 Zernike 精化出的拟合椭圆, 退化时按正圆画
+        // 优先画亚像素椭圆, 退化时按圆。
         mk.contour = new QGraphicsPathItem();
         if (r.hasEllipse)
             mk.contour->setPath(contourPath(r.ellipse));
@@ -1282,25 +1232,23 @@ void testDetect::finishDetect(const std::vector<DetectionResult>& results)
         m_scene->addItem(mk.contour);
         mk.contour->setZValue(2);
 
-        // 中心只留一个小点标出亚像素中心, 别把轮廓盖住
+        // 中心小点, 不遮挡轮廓。
         mk.dot = m_scene->addEllipse(mk.pos.x() - m_markRadius * 0.3,
             mk.pos.y() - m_markRadius * 0.3, m_markRadius * 0.6, m_markRadius * 0.6);
         mk.dot->setZValue(3);
 
         mk.label = new QGraphicsTextItem();
-        // 忽略视图变换 → 标签始终是固定的屏幕字号, 不会随放大变成巨幅挡住轮廓
+        // 忽略视图变换: 标签保持固定屏幕字号, 放大时不遮挡轮廓。
         mk.label->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
         mk.label->setHtml(idLabelHtml(mk.id, false, m_labelFontPx, mk.isMarker));
-        mk.label->setPos(mk.pos);   // 文字靠 HTML 里的 <br> 落到锚点下方
+        mk.label->setPos(mk.pos);   // HTML 的 <br> 让文字落在锚点下方
         m_scene->addItem(mk.label);
         mk.label->setZValue(3);
 
         m_markers.push_back(mk);
 
-        // 坐标是 Zernike 亚像素精化的结果(cv::Point2f), 按小数点后 3 位显示,
-        // 不要 round 成整数 —— 那会把亚像素精度整个抹掉。
-        // 后面带上拟合残差 RMS: 这才是精度的真实度量, 小数位数本身说明不了精度。
-        // 亚像素精化失败退回整数轮廓的, 明确标出来, 免得把 0.3px 的东西当亚像素结果用。
+        // 坐标保留 3 位小数(亚像素结果, 不能取整)。
+        // RMS 是拟合残差, 用于相对比较, 不是标定精度; 非亚像素结果明确标注。
         QString text = (m_markerMode
             ? QStringLiteral("  M%1   (%2, %3)   ")
             : QStringLiteral("  ID: %1   (%2, %3)   "))
@@ -1315,9 +1263,9 @@ void testDetect::finishDetect(const std::vector<DetectionResult>& results)
         QListWidgetItem* item = new QListWidgetItem(text, m_list);
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
         item->setCheckState(Qt::Unchecked);
-        item->setData(Qt::UserRole, (int)i);        // 关联回 m_markers 下标
+        item->setData(Qt::UserRole, (int)i);        // 关联 m_markers 下标
         if (!r.subpixel)
-            item->setForeground(QBrush(QColor(255, 170, 60)));   // 掉档的用橙色提醒
+            item->setForeground(QBrush(QColor(255, 170, 60)));   // 非亚像素: 橙色提醒
     }
     m_updatingList = false;
 
@@ -1360,9 +1308,8 @@ void testDetect::onToggleRoiMode(bool on)
     m_roiMode = on;
     m_btnRoi->setText(on ? QStringLiteral("结束画框") : QStringLiteral("开始画框"));
 
-    // 退出画框只收掉多边形, **不清空勾选**: 勾选现在代表"高亮这个点", 是浏览用的,
-    // 不该因为切一下模式就把用户挑好的一堆点全抹掉。要清空请用「清空选择」。
-    applyHighlights();      // 内部会顺带刷新状态栏, 所以下面的提示语必须放在它后面
+    // 退出画框只收多边形, 不清空勾选(勾选兼作浏览高亮)。
+    applyHighlights();      // 内部会刷新状态栏, 提示语必须在其后
 
     statusBar()->showMessage(on
         ? QStringLiteral("画框模式: 已勾选的点会连成 ROI 区域")
@@ -1382,9 +1329,8 @@ void testDetect::onItemClicked(QListWidgetItem* item)
     if (m_updatingList)
         return;
 
-    // 点在勾选框上时, Qt 已经替我们切换过(在 release 时), 所以勾选状态和按下那一刻不一样
-    // → 不能再翻一次, 否则两次刚好抵消、点了没反应。
-    // 点在行的其他位置时 Qt 不管, 状态没变 → 这里补上切换, 于是整行都可以点。
+    // 点勾选框时 Qt 已在 release 切换过(状态与按下时不同), 不能再翻一次;
+    // 点行其他位置时 Qt 不处理, 这里补一次, 于是整行可点。
     const bool qtAlreadyToggled = (item == m_pressedItem) && (item->checkState() != m_pressedCheckState);
     m_pressedItem = nullptr;
     if (qtAlreadyToggled)
@@ -1414,11 +1360,10 @@ void testDetect::applyHighlights()
             continue;
 
         Marker& mk = m_markers[idx];
-        // 勾上就高亮, **不需要先进画框模式** —— 识别完就能对着列表快速定位每个 ID 在图上哪儿
+        // 勾选即高亮, 不要求先进入画框模式。
         const bool on = (item->checkState() == Qt::Checked);
 
-        // 亚像素轮廓: 选中红色粗线, 正常青绿色细线, 精化掉档的用橙色虚线标出来 ——
-        // 高亮靠轮廓颜色/线型区分, 不再用固定大小的大圆盘, 免得盖住真正的拟合结果
+        // 轮廓配色: 选中红色粗线 / 正常青绿 / 非亚像素橙色虚线。
         QPen contourPen;
         if (on)
             contourPen = QPen(QColor(255, 60, 60), m_penW * 2.2);
@@ -1439,7 +1384,7 @@ void testDetect::applyHighlights()
         if (on) {
             selected.push_back(mk.pos);
             m_roiIds.push_back(mk.id);
-            mk.contour->setZValue(6);   // 高亮项压在其他项之上
+            mk.contour->setZValue(6);   // 高亮项置顶
             mk.dot->setZValue(7);
             mk.label->setZValue(8);
         }
@@ -1450,8 +1395,7 @@ void testDetect::applyHighlights()
         }
     }
 
-    // 多边形本身始终算好(顶点就是勾选的点), 但只在画框模式下画出来:
-    // 「开始画框」的语义是"我要圈一块区域出来", 平时勾选只是用来定位是哪个点。
+    // 多边形始终按勾选点计算, 仅在画框模式下绘制。
     m_roiPolygon = buildRoiPolygon(selected);
     if (m_roiItem) {
         m_roiItem->setPolygon(m_roiPolygon);
@@ -1514,8 +1458,7 @@ void testDetect::onFitView()
 {
     if (!m_pixmapItem)
         return;
-    // fitInView 内部会 scale, 而滚轮缩放把锚点设成了 AnchorUnderMouse,
-    // 那样"适应窗口"会被鼠标位置带偏, 所以这里临时换回 NoAnchor。
+    // fitInView 期间临时改回 NoAnchor, 避免 AnchorUnderMouse 把适应窗口带偏。
     const QGraphicsView::ViewportAnchor saved = m_view->transformationAnchor();
     m_view->setTransformationAnchor(QGraphicsView::NoAnchor);
     m_view->fitInView(m_pixmapItem, Qt::KeepAspectRatio);
@@ -1535,8 +1478,7 @@ void testDetect::updateZoomLabel()
 
 bool testDetect::eventFilter(QObject* watched, QEvent* event)
 {
-    // 列表的鼠标按下: 抢占记录勾选状态。过滤器在控件自己的事件处理之前跑, 所以这里一定拿得到
-    // "Qt 有没有替我们翻过" 的基准值(见 onItemClicked)。
+    // 记录按下瞬间的勾选态, 供 onItemClicked 判断 Qt 是否已切换。
     if (m_list && watched == m_list->viewport()) {
         if (event->type() == QEvent::MouseButtonPress) {
             QMouseEvent* me = static_cast<QMouseEvent*>(event);
@@ -1551,30 +1493,27 @@ bool testDetect::eventFilter(QObject* watched, QEvent* event)
             const int dy = we->angleDelta().y();
             if (dy == 0)
                 break;
-            // 1.0015^120 ≈ 1.20: 滚一格(120)约放大 20%。用指数而不是每次固定倍数,
-            // 放大/缩小才是严格互逆的, 来回滚不会漂。
+            // 1.0015^120 ≈ 1.20: 滚一格约 20%; 指数缩放保证放大/缩小严格互逆。
             const double factor = std::pow(1.0015, double(dy));
             const double cur = m_view->transform().m11();
-            // 夹住缩放范围, 免得几下滚飞了找不回图
+            // 限制缩放范围, 避免滚飞后找不回图。
             if ((factor > 1.0 && cur < 400.0) || (factor < 1.0 && cur > 0.002)) {
-                m_view->scale(factor, factor);   // 锚点是 AnchorUnderMouse → 以光标处为中心
-                m_autoFit = false;               // 手动缩放过, 之后 resize 不再抢回适应窗口
+                m_view->scale(factor, factor);   // 以光标为中心
+                m_autoFit = false;               // 手动缩放后不再自动适应窗口
                 updateZoomLabel();
             }
-            return true;    // 吃掉滚轮, 别让视图拿去上下滚动
+            return true;    // 消费滚轮, 避免视图滚动
         }
 
         case QEvent::Resize:
-            // m_pixmapItem 必须判空: 窗口刚出来、还没导入图片时视口就会发 Resize,
-            // 而 QGraphicsView::fitInView(const QGraphicsItem*, ...) 内部不判空,
-            // 直接解引用 item->d_ptr, 传 nullptr 会以 0xC0000005 读地址 0x8 崩掉。
+            // ⚠ 必须判空: 无图时视口也会发 Resize, 而 fitInView(item) 内部不判空, 会崩。
             if (m_autoFit && m_pixmapItem)
                 m_view->fitInView(m_pixmapItem, Qt::KeepAspectRatio);
             break;
 
         case QEvent::MouseButtonDblClick:
             if (static_cast<QMouseEvent*>(event)->button() == Qt::LeftButton)
-                onFitView();    // 双击回到适应窗口
+                onFitView();    // 双击恢复适应窗口
             break;
 
         default:
@@ -1616,8 +1555,7 @@ void testDetect::setBusy(bool busy)
     m_btnFit->setEnabled(!busy);
     m_btnRoi->setEnabled(!busy && !m_markers.isEmpty());
     m_btnClear->setEnabled(!busy && !m_markers.isEmpty());
-    // 识别进行中整栏禁用。DLL 侧本来就会给每次识别取一份参数快照(所以中途改不会崩),
-    // 但那样会出现"这次识别到底用的哪套参数"说不清的情况, 直接禁掉最不容易误判。
+    // 识别期间禁用整栏: 参数本身有快照保护, 但禁掉可避免"本次用的哪套参数"说不清。
     if (m_paramPane)
         m_paramPane->setEnabled(!busy);
 }
@@ -1625,15 +1563,10 @@ void testDetect::setBusy(bool busy)
 
 // ------------------------------------------------- 第二页「点云拼接」(MergeMarks)
 
-// MergeMarksLib.dll 依赖 PCL/VTK 的一批运行时 dll。查找顺序(前插进 PATH, 先命中先赢):
-//
-//   1) <exe目录>\runtime\  —— 发布包自带的那一份(build_release.ps1 组装)。**别人机器上只有这个**,
-//      所以它必须排第一: 开发机上这两处都能用, 但发布机上本机绝对路径根本不存在。
-//   2) 本机已装好的那几套绝对路径 —— 开发机直接跑 x64\Debug / x64\Release 时用, 免得每次都要
-//      先组装一遍发布包。换机器/换安装位置时改下面这一串即可。
-//
-// 注意第 1 条是"有就优先", 不做存在性判断: 往 PATH 里塞一个不存在的目录是无害的,
-// 少写一个分支反而更不容易出错。
+// MergeMarksLib 的 PCL/VTK 运行时目录, 前插到 PATH(先命中先赢):
+//   1) <exe>/runtime —— 发布包自带; 客户机器上只有这一份, 因此必须排第一;
+//   2) 本机绝对路径 —— 开发机直接运行 x64\{Debug,Release} 时使用。
+// 不存在的目录塞进 PATH 无害, 所以不做存在性判断。
 static const wchar_t* kMergeMarksRuntimeDirsDev =
     L"D:\\1yjy\\software\\newcomputer\\VTK\\VTK8.1.0\\install\\bin;"
     L"D:\\1yjy\\software\\newcomputer\\PCL 1.9.1\\bin;"
@@ -1642,7 +1575,7 @@ static const wchar_t* kMergeMarksRuntimeDirsDev =
     L"D:\\1yjy\\software\\newcomputer\\PCL 1.9.1\\3rdParty\\VTK\\bin;"
     L"D:\\1yjy\\software\\newcomputer\\PCL 1.9.1\\3rdParty\\OpenNI2\\Redist";
 
-// 组装出最终要前插到 PATH 的那一串目录(发布包 runtime 优先, 再是本机那几套)。
+// 组装要前插到 PATH 的目录串: runtime 优先, 其后是本机路径。
 static QString mergeMarksRuntimeSearchPath()
 {
     QStringList dirs;
@@ -1657,11 +1590,11 @@ static QString mergeMarksRuntimeSearchPath()
 
 void testDetect::onTabChanged(int index)
 {
-    // 只有第二页需要它; 已经加载过或已经失败过就不再折腾
+    // 仅第二页需要; 已加载或已失败则跳过。
     if (index != 1 || m_mmPanel || m_mmLoadTried)
         return;
 
-    // 加载那几十个 dll 要几秒, 先把提示画出来再阻塞, 免得看着像卡死
+    // 先刷新提示再阻塞加载, 否则界面看起来像卡死。
     m_mmPlaceholder->setText(QStringLiteral(
         "正在加载点云拼接模块…\n(首次需要加载 MergeMarksLib 及其 PCL/VTK 运行时)"));
     statusBar()->showMessage(QStringLiteral("正在加载点云拼接模块…"));
@@ -1684,11 +1617,9 @@ void testDetect::ensureMergeMarksLoaded()
         return;
     }
 
-    // 关键: PCL/VTK 的运行时目录必须在 LoadLibrary 之前进 PATH ——
-    // MergeMarksLib.dll 依赖它们, 加载它的那一刻加载器就要解析。
-    // 这件事不能交给那个 DLL 自己做(它那时还没被加载起来)。
-    // 用前插而不是 SetDefaultDllDirectories: 后者会把 PATH 从搜索路径里摘掉,
-    // 有把本来依赖的 Qt dll 一起弄找不到的风险。
+    // ⚠ 必须在 LoadLibrary 之前把运行时目录加入 PATH: 加载器此时就要解析依赖,
+    // 而 DLL 自身尚未加载, 无法代劳。不用 SetDefaultDllDirectories, 以免破坏
+    // Qt DLL 的搜索路径。
     {
         const QString prefixes = mergeMarksRuntimeSearchPath();
         std::wstring path(reinterpret_cast<const wchar_t*>(prefixes.utf16()));
@@ -1718,9 +1649,7 @@ void testDetect::ensureMergeMarksLoaded()
     m_mmDestroy = reinterpret_cast<FnMergeMarksDestroyPanel>(
         ::GetProcAddress(mod, "MergeMarks_DestroyPanel"));
     if (!create || !m_mmDestroy) {
-        // 这里也不卸载 mod —— 同析构函数里的理由: FreeLibrary 会连锁把 PCL/VTK 那批依赖
-        // 一起卸掉, 而 VTK 不支持在进程内卸载。这条错误分支上虽然还没创建任何 VTK 对象,
-        // 但卸载动作本身一样有风险, 而这里本来就是个无法继续的错误路径, 让它留在内存里即可。
+        // 同样不卸载: FreeLibrary 会连锁卸载 PCL/VTK, 而 VTK 不支持进程内卸载。
         m_mmModule = nullptr;
         m_mmDestroy = nullptr;
         showMergeMarksError(QStringLiteral(
@@ -1735,7 +1664,7 @@ void testDetect::ensureMergeMarksLoaded()
         return;
     }
 
-    // 面板建好后把占位提示换掉
+    // 用真实面板替换占位提示。
     qobject_cast<QVBoxLayout*>(m_mergeMarksPage->layout())->addWidget(
         static_cast<QWidget*>(m_mmPanel), 1);
     m_mmPlaceholder->hide();

@@ -37,12 +37,9 @@ class QShortcut;
 class QSpinBox;
 class QTabWidget;
 
-// 参数栏里一个参数对应的「控件 + 读写方式」。
-//
-// 参数一共三十来个, 而每个参数都要参与同一套动作: 建控件 / 从控件读值 / 往控件写值 /
-// 存 ini / 读 ini / 还原默认。若为每个参数各写一遍就是几百行样板, 所以这里把它们收敛成
-// 一张表 —— 上层只对 m_fields 循环, 新增参数只要在 buildParamPane 里加一行 addXxxField()。
-// read/write 由成员指针生成(见 addIntField 等), 所以表里不必出现每个字段的名字。
+// 一个参数对应的控件与读写方式。
+// 所有参数共用同一套操作(读写控件、存/读 ini、恢复默认), 因此收敛成 m_fields 表;
+// 新增参数只需在 buildParamPane 加一行 addXxxField()。
 struct ParamField {
     QString key;                                          // ini 键名(纯 ASCII)
     QWidget* w = nullptr;                                 // QCheckBox / QSpinBox / QDoubleSpinBox
@@ -52,10 +49,8 @@ struct ParamField {
     std::function<void(DetectorParams&, double)> write;   // 数值 -> 参数集
 };
 
-// 编码靶标识别界面:
-//   导入图片 -> 开始识别 -> 结果列表(ID + 坐标) -> 开始画框, 勾选若干 ID
-//   在结果画面上高亮, 并连成一块 ROI 多边形。
-//   右侧下方还有「参数设置」栏, 直接编辑识别算法的调参项(见 buildParamPane)。
+// 主窗口: 导入图片 → 识别 → 结果列表与叠加显示; 勾选结果可连成 ROI。
+// 右下角为识别参数面板(见 buildParamPane); 第二页为懒加载的点云拼接。
 class testDetect : public QMainWindow
 {
     Q_OBJECT
@@ -109,9 +104,7 @@ private:
 
     // ---- 参数设置栏 ----
     void buildParamPane(QWidget* paramPane);
-    // 往某个分组里加一个参数控件, 并把它注册进 m_fields; 返回新建的控件,
-    // 便于 buildParamPane 少数几处需要拿到具体控件(做联动禁用)。
-    // 三个 addXxxField 的唯一区别是控件类型与取值域, 读写都走传进来的成员指针。
+    // 建参数控件并注册到 m_fields; 返回控件供少数需要联动禁用的地方使用。
     QCheckBox* addBoolField(QFormLayout* form, const QString& key, const QString& label,
         const QString& tip, bool DetectorParams::* member);
     QSpinBox* addIntField(QFormLayout* form, const QString& key, const QString& label,
@@ -182,8 +175,7 @@ private:
     // 高级参数解锁状态。刻意不持久化: 每次启动都锁着, 避免客户机器上"一次输入永久可见"。
     bool m_advancedUnlocked = false;
 
-    // 联动禁用要用到的几个控件(见 updateParamDependents): 总开关关掉后, 那些
-    // "不再被算法读取"的参数要置灰, 免得用户对着一个不起作用的数字反复调。
+    // 联动禁用所需的控件(见 updateParamDependents)。
     QGroupBox* m_groupSubpixel = nullptr;
     QGroupBox* m_groupDecode = nullptr;
     QCheckBox* m_chkSubpixel = nullptr;
@@ -216,12 +208,10 @@ private:
     double m_penW = 2.0;
     double m_labelFontPx = 20.0;     // ID 标签字号(图像像素)
 
-    // 用于区分「点在勾选框上」和「点在行其他地方」:
-    // 点勾选框时 Qt 自己会切换, itemChanged 先于 itemClicked 触发, 比对状态就知道它翻过没有。
+    // 按下瞬间的勾选状态, 用于判断 Qt 是否已自行切换(见 onItemClicked)。
     QListWidgetItem* m_pressedItem = nullptr;
     Qt::CheckState m_pressedCheckState = Qt::Unchecked;
 
-    // 识别线程。用 QPointer 而不是裸指针: 线程跑完会 deleteLater 掉自己,
-    // 裸指针之后就是悬空的, 析构里再 isRunning() 就是 use-after-free。
+    // 线程结束后会 deleteLater 自身, 必须用 QPointer 防止悬空。
     QPointer<QThread> m_thread;
 };

@@ -6,15 +6,12 @@
 #include <QFont>
 #include <QFile>
 
-//ceshi1020
-//   1) Fusion —— 系统原生样式对调色板和样式表的响应不一致, 且会把部分控件(滚动条、
-//      勾选框等)按浅色画出来。换成 Fusion 后调色板与 QSS 才是同一套。
-//   2) QPalette —— 覆盖样式表够不到的原生绘制部分(禁用文字、工具提示、原生高亮)。
-//   3) theme.qss —— 真正的观感都在那份资源里, 见文件头部说明。
-//
-// ⚠ 必须在窗口 show() 之前设好: MergeMarksLib 面板是切到「点云拼接」页才创建的
-// (懒加载), 届时样式表已经装在 QApplication 上, 面板控件创建时就自动套用,
-// 于是两个页签是同一套主题 —— 这也是「一处定义、两个页签统一」的原理
+// 深色主题, 三部分:
+//   1) Fusion 样式 —— 原生样式对 palette/QSS 响应不一致, 且会用浅色绘制部分控件;
+//   2) QPalette —— 覆盖 QSS 够不到的原生绘制(禁用文字、tooltip、高亮);
+//   3) theme.qss —— 主要观感。
+// ⚠ 必须在 show() 之前调用: 点云面板是懒加载, 创建时会自动套用已安装的全局样式表,
+// 因此两个页签共用同一套主题。
 static void applyDarkTechTheme(QApplication& app)
 {
     app.setStyle(QStyleFactory::create(QStringLiteral("Fusion")));
@@ -48,10 +45,8 @@ static void applyDarkTechTheme(QApplication& app)
 
     app.setPalette(p);
 
-    // 默认字体。注意基础字体只在这里设, 不放进 theme.qss: 样式表里的字体属性
-    // 会盖掉代码里 setFont() 的结果, 而结果列表/日志框靠 setFont 拿等宽字体,
-    // 放进去就会把数字对齐毁掉(theme.qss 头部也记了这条)。
-    // Segoe UI 没有中文字形, 所以显式给出回退链, 别依赖系统的自动替换。
+    // 基础字体只在这里设, 不放 theme.qss: QSS 的 font 会压过代码里的 setFont(),
+    // 破坏结果列表/日志框的等宽对齐。Segoe UI 无中文字形, 显式给出回退链。
     QFont f = app.font();
     f.setFamilies({ QStringLiteral("Segoe UI"),
                     QStringLiteral("Microsoft YaHei UI"),
@@ -73,8 +68,7 @@ int main(int argc, char* argv[])
     applyDarkTechTheme(a);
 
     testDetect w;
-    // 启动即最大化: 识别界面要高分辨率图 + 结果列表 + 参数栏三块并排, 窗口化起步太窄。
-    // 需要无边框全屏时按 F11(或点顶部按钮条最右的「全屏 F11」), Esc/F11 退回最大化。
+    // 三栏并排需要足够宽度, 启动即最大化; F11 进入无边框全屏, Esc/F11 返回。
     w.showMaximized();
 
     return a.exec();
