@@ -47,6 +47,7 @@ struct ParamField {
     QString key;                                          // ini 键名(纯 ASCII)
     QWidget* w = nullptr;                                 // QCheckBox / QSpinBox / QDoubleSpinBox
     QGroupBox* group = nullptr;                           // 它属于哪个分组(整组联动禁用要用)
+    bool basic = false;                                   // true = 默认用户可见; false = 需密码解锁
     std::function<double(const DetectorParams&)> read;    // 参数集 -> 数值(填控件用)
     std::function<void(DetectorParams&, double)> write;   // 数值 -> 参数集
 };
@@ -82,6 +83,7 @@ private slots:
     void onResetParams();          // 【恢复默认】
     void onSaveParamsFile();       // 【保存参数…】
     void onLoadParamsFile();       // 【载入参数…】
+    void onUnlockAdvanced();       // 【高级参数…】输入密码解锁 / 收起
     void onToggleFullScreen();     // F11 / 【全屏】
 
 private:
@@ -123,6 +125,8 @@ private:
     void applyParamsToDetector();                         // 控件 -> setParams -> 落盘
     void setParamsDirty(bool dirty);                      // 更新"未应用"提示
     void updateParamDependents();                         // 参数间的联动禁用
+    void setAdvancedUnlocked(bool on);                    // 切换高级参数权限
+    void applyParamVisibility();                          // 按权限显示/隐藏参数行与分组
 
     QString paramsIniPath() const;
     void saveParamsIni();
@@ -169,14 +173,19 @@ private:
     QPushButton* m_btnResetParams = nullptr;
     QPushButton* m_btnSaveParams = nullptr;
     QPushButton* m_btnLoadParams = nullptr;
+    QPushButton* m_btnUnlock = nullptr;    // 【高级参数…】默认用户看不到高级项
     QPushButton* m_btnFullScreen = nullptr;
     QShortcut* m_shortcutEsc = nullptr;    // 只在全屏时启用, 避免抢走控件的 Esc
     bool m_paramsDirty = false;
+    bool m_basicDirty = false;             // 未应用的改动里是否含"默认用户可见"的项
     bool m_updatingParams = false;         // 程序化填控件时抑制"被改动"判定
+    // 高级参数解锁状态。刻意不持久化: 每次启动都锁着, 避免客户机器上"一次输入永久可见"。
+    bool m_advancedUnlocked = false;
 
     // 联动禁用要用到的几个控件(见 updateParamDependents): 总开关关掉后, 那些
     // "不再被算法读取"的参数要置灰, 免得用户对着一个不起作用的数字反复调。
     QGroupBox* m_groupSubpixel = nullptr;
+    QGroupBox* m_groupDecode = nullptr;
     QCheckBox* m_chkSubpixel = nullptr;
     QCheckBox* m_chkOtsu = nullptr;
     QWidget* m_spinFixedThr = nullptr;

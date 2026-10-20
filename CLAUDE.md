@@ -120,6 +120,8 @@ Every tuning constant of the algorithm lives in `DetectorParams` (`include/Targe
 **参数设置** pane at the bottom right of tab 1 is its UI: 32 fields in four groups (预处理 / 轮廓筛选 /
 亚像素精化 / 解码与去重). Before this, every threshold was a hardcoded literal in `TargetDetector.cpp`
 and tuning one meant editing source, rebuilding the DLL and restarting.
+Per-parameter meaning, tuning direction and a symptom→parameter table live in `参数说明.md` at the
+repo root; the in-app tooltips carry the same conclusions in condensed form.
 
 - Flow: edit a field → 【应用参数】→ `m_detector.setParams()` **and** write `<exe dir>/settings.ini`.
   Startup reads that ini back; no ini → factory defaults. 保存参数…/载入参数… export/import the same
@@ -141,6 +143,15 @@ and tuning one meant editing source, rebuilding the DLL and restarting.
   `refineBandRatio` (0.18) vs the hardcoded radial step coefficient 0.18 inside `codeBrightAtAngle`.
 - The dependent-disable greying (`updateParamDependents`) is a *hint* only: disabled fields are still
   read by `collectParams()` and passed to the DLL, the algorithm just stops using them.
+- **Two-tier visibility**: default users see only the 8 keys listed in `isBasicParamKey()`; the other
+  24 (all of 亚像素精化 + 解码与去重, plus the geometric ratios in 轮廓筛选) stay hidden until
+  【高级参数…】 receives the owner password. `verifyAdvancedPassword()` stores only an FNV-1a 64
+  hash, not the plaintext. Unlock state is deliberately **not** persisted (locked on every launch).
+  Hidden widgets are still constructed and keep their values, so `collectParams()`/`saveParamsIni()`
+  stay complete — this is a UI gate, not a data wall. Three bypasses are closed while locked:
+  恢复默认 resets only visible keys, 载入参数… ignores advanced keys from the file, and
+  【收起高级参数】 discards unapplied advanced edits. New parameters default to advanced; add the
+  key to `kBasic` to expose one. See `参数说明.md` §1.5.
 
 #### ⚠ `TargetDetector.h` exists twice and the two copies must stay identical
 

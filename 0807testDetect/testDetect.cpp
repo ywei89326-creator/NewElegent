@@ -14,6 +14,7 @@
 #include <QFile>
 
 #include <QApplication>
+#include <QByteArray>
 #include <QCheckBox>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
@@ -30,7 +31,9 @@
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMessageBox>
@@ -39,6 +42,7 @@
 #include <QPainterPath>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSet>
 #include <QSettings>
 #include <QShortcut>
 #include <QSpinBox>
@@ -381,6 +385,43 @@ void setWidgetValue(QWidget* w, double v)
         sb->setValue((int)qRound(v));
 }
 
+// ---------------------------------------------------------------- 参数权限
+//
+// 两档参数:
+//   默认用户 —— 只看到「改了有明显效果、日常真的会动到」的少数几项;
+//   高级     —— 需要密码解锁, 包含几何比例、拟合内部量和整个解码/去重链路。
+// 判据放在 key 上而不是控件指针上, 这样三个 addXxxField 里都不必改调用点;
+// 新增参数时**默认落在高级侧**, 想让默认用户看到就把 key 加进 kBasic。
+bool isBasicParamKey(const QString& key)
+{
+    static const QSet<QString> kBasic = {
+        QStringLiteral("useOtsu"),            // 大津法
+        QStringLiteral("fixedThreshold"),     // 固定阈值
+        QStringLiteral("erodeKernel"),        // 腐蚀核
+        QStringLiteral("bigBlobAreaRatio"),   // 大块白斑
+        QStringLiteral("brightThr"),          // 亮像素阈值
+        QStringLiteral("minRingDirHits"),     // 方向命中数
+        QStringLiteral("minApproxVertices"),  // 最少顶点数
+        QStringLiteral("minCandidateRadius")  // 候选最小半径
+    };
+    return kBasic.contains(key);
+}
+
+// 高级参数密码校验。源码里不保存明文, 只存密码 UTF-8 字节的 FNV-1a 64 位散列,
+// 用 strings 扫 exe 也扫不到。
+// ⚠ 这不是安全边界, 只是不让客户随手改到内部参数; 真要防住, 得把参数校验放到 DLL 里。
+// 换密码: 按同样的 FNV-1a 64(初始 0xcbf29ce484222325, 乘数 0x100000001b3)重算常量。
+bool verifyAdvancedPassword(const QString& s)
+{
+    quint64 h = 0xcbf29ce484222325ULL;
+    const QByteArray bytes = s.toUtf8();
+    for (char c : bytes) {
+        h ^= static_cast<quint8>(c);
+        h *= 0x100000001b3ULL;
+    }
+    return h == 0x79e7d2dc263df9b8ULL;   // 高级参数密码的散列(明文只在项目所有者手里)
+}
+
 } // namespace
 
 QCheckBox* testDetect::addBoolField(QFormLayout* form, const QString& key, const QString& label,
@@ -395,6 +436,7 @@ QCheckBox* testDetect::addBoolField(QFormLayout* form, const QString& key, const
     f.key = key;
     f.w = cb;
     f.group = qobject_cast<QGroupBox*>(form->parentWidget());
+    f.basic = isBasicParamKey(key);
     f.read = [member](const DetectorParams& p) -> double { return (p.*member) ? 1.0 : 0.0; };
     f.write = [member](DetectorParams& p, double v) { p.*member = (v != 0.0); };
     m_fields.push_back(f);
@@ -418,6 +460,7 @@ QSpinBox* testDetect::addIntField(QFormLayout* form, const QString& key, const Q
     f.key = key;
     f.w = sb;
     f.group = qobject_cast<QGroupBox*>(form->parentWidget());
+    f.basic = isBasicParamKey(key);
     f.read = [member](const DetectorParams& p) -> double { return (double)(p.*member); };
     f.write = [member](DetectorParams& p, double v) { p.*member = (int)qRound(v); };
     m_fields.push_back(f);
@@ -447,6 +490,7 @@ QDoubleSpinBox* testDetect::addDoubleField(QFormLayout* form, const QString& key
     f.key = key;
     f.w = dsb;
     f.group = qobject_cast<QGroupBox*>(form->parentWidget());
+    f.basic = isBasicParamKey(key);
     f.read = [member](const DetectorParams& p) -> double { return (double)(p.*member); };
     f.write = [member](DetectorParams& p, double v) { p.*member = v; };
     m_fields.push_back(f);
@@ -490,71 +534,90 @@ void testDetect::buildParamPane(QWidget* paramPane)
     il->addWidget(makeParamGroup(inner, QStringLiteral("轮廓筛选"), &fCirc));
     m_groupSubpixel = makeParamGroup(inner, QStringLiteral("亚像素精化"), &fSub);
     il->addWidget(m_groupSubpixel);
-    il->addWidget(makeParamGroup(inner, QStringLiteral("解码与去重"), &fDec));
+    // 这两组整组都是高级参数: 锁定状态下整块隐藏, 避免留下空卡片。
+    m_groupDecode = makeParamGroup(inner, QStringLiteral("解码与去重"), &fDec);
+    il->addWidget(m_groupDecode);
 
     // ---- 预处理 ----
     m_chkOtsu = addBoolField(fPre, QStringLiteral("useOtsu"), QStringLiteral("大津法"),
         QStringLiteral("是否用大津法自动求二值化阈值(默认开)。\n"
                        "取消后改用下面的「固定阈值」, 适合整体偏暗/偏亮、\n"
-                       "大津法切不干净导致靶标与背景连成一片的图。"),
+                       "大津法切不干净导致靶标与背景连成一片的图。\n"
+                       "判断切得对不对: 中心圆盘应是一整块白, 背景基本全黑。\n"
+                       "二值化一变, 测出的半径 R 也会变, 下游所有 ×R 采样位置跟着移动。"),
         &DetectorParams::useOtsu);
     m_spinFixedThr = addIntField(fPre, QStringLiteral("fixedThreshold"), QStringLiteral("固定阈值"),
-        QStringLiteral("二值化灰度阈值, 仅当「大津法」取消勾选时生效。\n"
-                       "调低 → 更多像素算作白(前景变多); 调高 → 更少。\n"
-                       "典型范围 60~180。"),
+        QStringLiteral("二值化灰度阈值, 仅当「大津法」取消勾选时生效(灰显时改了也没用)。\n"
+                       "像素灰度 > 该值记为白: 调低 → 更多像素算白(前景变多, 易粘连);\n"
+                       "调高 → 更少(靶标可能被切碎)。典型范围 60~180。\n"
+                       "方向: 调到中心圆盘是完整白块、背景基本全黑为止。"),
         1, 254, &DetectorParams::fixedThreshold);
     addIntField(fPre, QStringLiteral("erodeKernel"), QStringLiteral("腐蚀核"),
-        QStringLiteral("腐蚀操作的结构元边长(奇数, 默认 5)。\n"
-                       "调大 → 白色区域被啃得更瘦, 细窄的反光条纹/毛刺会先消失,\n"
-                       "但过大也会把靶标编码块啃断。"),
+        QStringLiteral("腐蚀操作的结构元边长(奇数, 默认 5; 偶数会自动夹成奇数)。\n"
+                       "调大 → 白色区域被啃得更瘦, 细窄的反光条纹/毛刺先消失, 误检减少;\n"
+                       "但过大也会把编码块啃断、把中心盘啃小(半径 R 变小)。\n"
+                       "远距离小靶标、编码块很细时必须调小到 3。"),
         3, 21, &DetectorParams::erodeKernel);
     addDoubleField(fPre, QStringLiteral("bigBlobAreaRatio"), QStringLiteral("大块白斑"),
         QStringLiteral("剔除大面积白色连通域的面积占比阈值(默认 0.02 = 全图 2%)。\n"
-                       "工件反光加工面在二值化后常整片连成一大块, 用这个把它先删掉,\n"
-                       "后面的轮廓/Zernike 只面对真靶标, 明显提速。填 0 = 不删任何大块。"),
+                       "连通域面积 ≥ 该比例 × 全图面积就整个删掉(只删它自己的像素)。\n"
+                       "工件反光加工面在二值化后常整片连成一大块, 先删掉可明显提速。\n"
+                       "调小 → 更激进(删得更多); 调大 → 更保守; 0 = 完全不删。\n"
+                       "靶标与反光面粘连、被一起删掉时, 先填 0 验证是不是这个原因。"),
         0.0, 0.5, 3, &DetectorParams::bigBlobAreaRatio);
 
     // ---- 轮廓筛选 ----
     addDoubleField(fCirc, QStringLiteral("maxAspect"), QStringLiteral("长短轴比"),
-        QStringLiteral("候选轮廓的长短轴比上限(默认 1.9)。中心圆盘接近正圆 ≈1,\n"
-                       "细长的跑道形编码块比值更大。调小 → 候选更少更干净,\n"
-                       "调大 → 收进更多圆润的编码块(靠后面的解码和去重再筛掉)。"),
+        QStringLiteral("候选轮廓拟合椭圆的长短轴比上限(默认 1.9)。中心圆盘接近正圆 ≈1,\n"
+                       "细长的跑道形编码块比值更大。调小(1.3~1.6) → 候选更少更干净,\n"
+                       "但大倾角靶标可能被误杀; 调大 → 收进更多圆润的编码块\n"
+                       "(靠后面的编码带判据和解码再筛)。误检多时优先调小这一项。"),
         1.0, 10.0, 2, &DetectorParams::maxAspect);
     addDoubleField(fCirc, QStringLiteral("minDiscFill"), QStringLiteral("圆盘亮占比"),
         QStringLiteral("候选轮廓最小外接圆内“亮”像素的占比下限(默认 0.7)。\n"
                        "实心中心圆盘的外接圆几乎全白(≈1); 编码块/弧段的外接圆\n"
-                       "远大于它的白色实体, 占比明显偏低。调高 → 更严。"),
+                       "远大于它的白色实体, 占比明显偏低。\n"
+                       "调高(0.8~0.9) → 更严, 专治把弧形反光/编码块当中心; 调太低等于不筛。\n"
+                       "它用的是未二值化的灰度图 + 「亮像素阈值」判定。"),
         0.0, 1.0, 2, &DetectorParams::minDiscFill);
     addIntField(fCirc, QStringLiteral("brightThr"), QStringLiteral("亮像素阈值"),
-        QStringLiteral("判断像素“亮”的灰度阈值(默认 120), 同时用于圆盘亮占比\n"
-                       "和去重时的黑白评分。偏暗的图调低一些。"),
+        QStringLiteral("判断像素“亮”的灰度阈值(默认 120), 被三处复用: 圆盘亮占比、\n"
+                       "编码带环绕判定(在原始灰度图上采样)、去重时的黑白评分。\n"
+                       "偏暗的图调低(80~100), 过曝/反光强调高(150~180)。\n"
+                       "注意它不是二值化阈值 —— 二值化由「大津法/固定阈值」决定。"),
         0, 255, &DetectorParams::brightThr);
     addDoubleField(fCirc, QStringLiteral("minRing"), QStringLiteral("编码带内沿"),
         QStringLiteral("编码环跑道块所在径向带的内沿, 单位是中心圆盘半径 R 的倍数\n"
-                       "(默认 2.3)。用比例而不是绝对像素, 相机远近变化时自动等比。"),
+                       "(默认 2.3)。用比例而不是绝对像素, 相机远近变化时自动等比。\n"
+                       "调到 1 附近会从圆盘边缘开始采, 那里本身就是亮的, 24 个方向\n"
+                       "会全部命中, 这一关就形同虚设。"),
         1.0, 10.0, 2, &DetectorParams::minRing);
     addDoubleField(fCirc, QStringLiteral("maxRing"), QStringLiteral("编码带外沿"),
         QStringLiteral("编码环径向带的外沿 ×R(默认 4.2)。\n"
                        "注意它和「解码与去重」组里的编码带外沿(默认 4.1)不是同一个数:\n"
-                       "这里判“是否被编码带环绕”, 那里是解码时的采样范围, 别改成一样。"),
+                       "这里判“是否被编码带环绕”, 那里是解码时的采样范围, 别改成一样。\n"
+                       "调太大会采到旁边靶标或背景反光, 产生误检。"),
         1.0, 10.0, 2, &DetectorParams::maxRing);
     addIntField(fCirc, QStringLiteral("minRingDirHits"), QStringLiteral("方向命中数"),
         QStringLiteral("环上共采样 24 个方向, 至少这么多个方向看到编码块, 才认为该候选\n"
-                       "被编码带环绕(默认 4)。调高 → 只认真被编码环包围的圆盘, 更严; \n"
-                       "编码块缺失/遮挡多时可适当调低。"),
+                       "被编码带环绕(默认 4)。调高(8~12) → 只认真被编码环包围的圆盘,\n"
+                       "误检明显减少; 调低(2~3) → 编码块缺失/遮挡多时用, 但会放进假候选。\n"
+                       "这是“漏检 vs 误检”的主要旋钮之一。"),
         0, 24, &DetectorParams::minRingDirHits);
     addDoubleField(fCirc, QStringLiteral("approxEpsRatio"), QStringLiteral("逼近精度"),
         QStringLiteral("多边形逼近的精度, 单位是轮廓周长的倍数(默认 0.03)。\n"
-                       "只用来数顶点个数, 不参与椭圆拟合。调大 → 逼近更粗, 顶点更少。"),
+                       "只用来数顶点个数(配合「最少顶点数」), 不参与椭圆拟合。\n"
+                       "调大 → 逼近更粗、顶点更少, 相当于把「最少顶点数」这道门槛收紧。"),
         0.0005, 0.5, 4, &DetectorParams::approxEpsRatio);
     addIntField(fCirc, QStringLiteral("minApproxVertices"), QStringLiteral("最少顶点数"),
         QStringLiteral("多边形逼近后顶点数少于该值的轮廓整个丢弃(默认 5)。\n"
-                       "小靶标(远距离)顶点本来就少, 识别不到远处靶标时可以调低。"),
+                       "小靶标(远距离)顶点本来就少, 识别不到远处靶标时可以调低到 3~4; \n"
+                       "调高可挡掉二值化毛刺形成的碎轮廓。"),
         3, 1000, &DetectorParams::minApproxVertices);
     addDoubleField(fCirc, QStringLiteral("minCandidateRadius"), QStringLiteral("候选最小半径"),
-        QStringLiteral("候选的最小半径(像素, 默认 1.0)。低于它的轮廓和外接圆直接丢弃,\n"
-                       "用来挡掉二值化毛刺。常见量级 0.5~3, 不要填太大,\n"
-                       "否则远距离小靶标会被整批丢掉。"),
+        QStringLiteral("候选的最小半径(像素, 默认 1.0)。拟合椭圆短半轴或最小外接圆\n"
+                       "半径低于它就直接丢弃, 用来挡掉二值化毛刺。\n"
+                       "常见量级 0.5~3, 不要填太大, 否则远距离小靶标会被整批丢掉。"),
         0.0, 200.0, 2, &DetectorParams::minCandidateRadius);
 
     // ---- 亚像素精化 ----
@@ -562,87 +625,114 @@ void testDetect::buildParamPane(QWidget* paramPane)
         QStringLiteral("是否做 Zernike 亚像素精化(默认开)。\n"
                        "取消后中心直接用整数轮廓的拟合结果, 精度掉到 ~0.3px 量级,\n"
                        "结果列表里会全部标成橙色的「(!)非亚像素」——\n"
-                       "可以用它对照“精化到底带来了多少提升”。"),
+                       "可以用它对照“精化到底带来了多少提升”, 也可以用来提速。\n"
+                       "取消后本组其余参数灰显, 算法也不再读取。"),
         &DetectorParams::subpixelEnable);
     addDoubleField(fSub, QStringLiteral("refineBandRatio"), QStringLiteral("选点带宽比"),
         QStringLiteral("挑选亚像素边缘点的带宽半宽, 单位是半径 R 的倍数(默认 0.18)。\n"
-                       "这是最该先试的一个参数: 调小 → 只取最贴近边缘的点, 拟合更干净;\n"
-                       "调太小可能点不够而精化失败(退回整数轮廓)。"),
+                       "实际半宽 = max(「带宽下限px」, 该值 × R), 圆的有效带宽是它的 2 倍。\n"
+                       "它同时决定椭圆拟合的归一化带宽(再被下面两个椭圆带宽参数夹住)。\n"
+                       "调小 → 只取最贴近边缘的点, 拟合更干净; 调太小会点数不足而精化失败\n"
+                       "(结果变橙色)。这是最该先试的一个参数。"),
         0.01, 1.0, 3, &DetectorParams::refineBandRatio);
     addDoubleField(fSub, QStringLiteral("refineBandMin"), QStringLiteral("带宽下限px"),
         QStringLiteral("上面那个带宽的下限(像素, 默认 0.8)。靶标很小(R 只有几个像素)时\n"
-                       "0.18R 会小于 1 个像素, 靠这个下限保证仍然能取到一条可拟合的带。"),
+                       "0.18R 会小于 1 个像素, 靠这个下限保证仍然能取到一条可拟合的带。\n"
+                       "小靶标结果全是橙色时可降到 0.5。"),
         0.0, 200.0, 2, &DetectorParams::refineBandMin);
     addDoubleField(fSub, QStringLiteral("roiScale"), QStringLiteral("ROI 半径倍数"),
-        QStringLiteral("Zernike 扫描区域的半径 ÷ R(默认 1.5)。\n"
+        QStringLiteral("Zernike 扫描区域的半径 ÷ R(默认 1.5), 实际半边还会再加 8px。\n"
                        "必须盖得住“选点带最远处”(约 1.2R)再加 7×7 模板的边距。\n"
-                       "调小可以更快, 但盖不住就会漏掉本该参与拟合的边缘点。"),
+                       "调小可以更快, 但低于约 1.25 就开始漏边缘点(点数下降、中心偏移);\n"
+                       "若调大了「椭圆带宽上限」, 这里也要相应调大。"),
         1.0, 8.0, 2, &DetectorParams::roiScale);
     addDoubleField(fSub, QStringLiteral("zernikeKMin"), QStringLiteral("阶跃强度初筛"),
-        QStringLiteral("Zernike 边缘点的阶跃强度初筛下限(默认 5.0)。\n"
-                       "低于它的像素直接不算边缘点。调高 → 只保留对比强烈的边缘,\n"
-                       "弱边界的靶标可能整个被跳过。"),
+        QStringLiteral("Zernike 边缘点的阶跃强度初筛下限(默认 5.0), 是第一道、最便宜的门槛。\n"
+                       "低于它的像素直接不算边缘点。调高 → 只保留对比强烈的边缘, 速度更快,\n"
+                       "但弱边界的靶标可能整个从候选里消失(不是变橙, 是根本没进来);\n"
+                       "调低(2~3) → 弱对比/模糊图能用, 代价是变慢、易被反光边缘带偏。"),
         0.0, 10000.0, 1, &DetectorParams::zernikeKMin);
     m_chkOtsuK = addBoolField(fSub, QStringLiteral("useOtsuK"), QStringLiteral("k 阈值用大津法"),
         QStringLiteral("是否用大津法自适应地在本候选附近的边缘点上求阶跃强度阈值(默认开)。\n"
                        "注意是“局部”统计: 全图统计会被反光面的海量强边缘带偏, 反而把\n"
-                       "真靶标的弱边缘一起拒掉。取消后改用下面的「固定 k 阈值」。"),
+                       "真靶标的弱边缘一起拒掉。取消后改用下面的「固定 k 阈值」。\n"
+                       "它是第二道门槛: 「阶跃强度初筛」在前、更粗, 这一道决定谁真正参与拟合。"),
         &DetectorParams::useOtsuK);
     m_spinFixedKt = addDoubleField(fSub, QStringLiteral("fixedKt"), QStringLiteral("固定 k 阈值"),
-        QStringLiteral("阶跃强度阈值, 仅当「k 阈值用大津法」取消勾选时生效。\n"
-                       "参考值: 大津法在这批样本上算出来通常在 20~60。\n"
-                       "注意它与上面的「阶跃强度初筛」是两级门槛, 初筛在前、更粗。"),
+        QStringLiteral("阶跃强度阈值, 仅当「k 阈值用大津法」取消勾选时生效(灰显时改了也没用)。\n"
+                       "参考值: 大津法在这批样本上算出来通常在 20~60; 手动可先试 10~30。\n"
+                       "调低 → 更多边缘点参与拟合(可能更准, 也可能被噪点拉偏)。\n"
+                       "注意它与「阶跃强度初筛」是两级门槛, 两道都调低才是真正放宽。"),
         0.0, 10000.0, 1, &DetectorParams::fixedKt);
     addIntField(fSub, QStringLiteral("minFitPoints"), QStringLiteral("最少拟合点数"),
-        QStringLiteral("参与最小二乘拟合的最少亚像素点数(默认 6)。少于它就判定精化失败,\n"
-                       "退回整数轮廓。点太少时拟合出来的圆/椭圆没有意义, 所以有这道闸。"),
+        QStringLiteral("参与最小二乘拟合的最少亚像素点数(默认 6), 圆拟合和椭圆拟合都用它。\n"
+                       "少于它就判定该次精化失败: 圆失败退回整数轮廓(变橙); 椭圆失败则只留\n"
+                       "圆的结果 —— 倾斜靶标会因此走“纯圆”解码路径, 容易解不出 ID。\n"
+                       "点太少时拟合没有意义, 不要调到 3 以下。"),
         3, 100000, &DetectorParams::minFitPoints);
     addDoubleField(fSub, QStringLiteral("ellipseBandMin"), QStringLiteral("椭圆带宽下限"),
-        QStringLiteral("椭圆精化的归一化带宽下限(默认 0.04)。带太窄会挑不出点。"),
+        QStringLiteral("椭圆精化的归一化带宽下限(默认 0.04)。椭圆取点的归一化半径带是\n"
+                       "[1-band, 1+band], band 由「选点带宽比」算出后被这两个界限夹住。\n"
+                       "带太窄会挑不出点, 不要低于 0.03。"),
         0.005, 0.5, 3, &DetectorParams::ellipseBandMin);
     addDoubleField(fSub, QStringLiteral("ellipseBandMax"), QStringLiteral("椭圆带宽上限"),
-        QStringLiteral("椭圆精化的归一化带宽上限(默认 0.20)。带太宽会把非边缘点混进来。"),
+        QStringLiteral("椭圆精化的归一化带宽上限(默认 0.20)。带太宽会把非边缘点混进来。\n"
+                       "大倾角靶标可以提到 0.25~0.30 让椭圆更容易拟合成功;\n"
+                       "注意最远点会到 (1+band)R, 调大后「ROI 半径倍数」也要跟着调大。"),
         0.01, 1.0, 3, &DetectorParams::ellipseBandMax);
     addDoubleField(fSub, QStringLiteral("ellipseBandShrink"), QStringLiteral("二次收缩比"),
         QStringLiteral("第二次重拟合时带宽的收缩比(默认 0.6), 用来剔掉毛刺。\n"
-                       "拟合用的带和算残差 RMS 用的带必须是同一个值 —— \n"
+                       "调小 → 更狠地剔离群点, 但可能点数不足; 调大(1.0) = 不做二次精化。\n"
+                       "拟合用的带和算残差 RMS 用的带都是收缩后的同一条带 —— \n"
                        "改成别的数, 前后的 RMS 就不能直接比了。"),
         0.05, 1.0, 2, &DetectorParams::ellipseBandShrink);
     addDoubleField(fSub, QStringLiteral("minAxisRatio"), QStringLiteral("短长轴比下限"),
         QStringLiteral("拟合椭圆的短轴/长轴下限(默认 0.2)。比值更小的“椭圆”多半是\n"
-                       "拟合到了一条弧段或一串噪点, 直接判不可信。"),
+                       "拟合到了一条弧段或一串噪点, 直接判不可信。\n"
+                       "调高(0.3~0.5) → 更严, 但大倾角靶标可能判椭圆精化失败;\n"
+                       "椭圆失败会让该靶标退回“纯圆”解码, 倾斜时容易解不出 ID。"),
         0.0, 1.0, 2, &DetectorParams::minAxisRatio);
 
     // ---- 解码与去重 ----
     addDoubleField(fDec, QStringLiteral("codeRingInner"), QStringLiteral("编码带内沿"),
-        QStringLiteral("解码采样时编码环径向带的内沿 ×R(默认 2.3)。"),
+        QStringLiteral("解码采样时编码环径向带的内沿 ×R(默认 2.3)。\n"
+                       "它与「轮廓筛选」组里的编码带内沿是两处独立的数, 改一处不影响另一处。\n"
+                       "调到 1.x 会从圆盘边缘开始采, 边缘本身就是亮的, 容易把所有位读成 1。"),
         1.0, 10.0, 2, &DetectorParams::codeRingInner);
     addDoubleField(fDec, QStringLiteral("codeRingOuter"), QStringLiteral("编码带外沿"),
         QStringLiteral("解码采样时编码环径向带的外沿 ×R(默认 4.1)。\n"
-                       "与「轮廓筛选」组里的编码带外沿(默认 4.2)不是同一个数, 不要改成一样。"),
+                       "与「轮廓筛选」组里的编码带外沿(默认 4.2)不是同一个数, 不要改成一样。\n"
+                       "解码 ROI 是 4.5R 见方, 超过 4.5 的采样点落在 ROI 外会被忽略, 等于没效果。"),
         1.0, 10.0, 2, &DetectorParams::codeRingOuter);
     addIntField(fDec, QStringLiteral("codeBrightThr"), QStringLiteral("编码块亮阈值"),
-        QStringLiteral("判定编码块的灰度阈值(默认 200)。比「亮像素阈值」更严, 因为\n"
-                       "编码块是纯白跑道块, 用高阈值能少受反光和灰边影响。"),
+        QStringLiteral("判定编码块采样的“亮”阈值(默认 200)。\n"
+                       "注意: 当前实现里解码用的是二值图(只有 0/255), 所以取 1~254 之间\n"
+                       "任何值效果都完全相同 —— 这个参数现在几乎不起作用, 解不出 ID 时\n"
+                       "不要在这上面调, 优先看「拉正二值化阈值」和两个位判定参数。\n"
+                       "只有设成 0(几乎全算亮)或 255(全算暗)才会改变行为, 通常都是错的。"),
         0, 255, &DetectorParams::codeBrightThr);
     addIntField(fDec, QStringLiteral("rectifyBinThr"), QStringLiteral("拉正二值化阈值"),
         QStringLiteral("倾斜靶标做仿射拉正后重新二值化的阈值(默认 127)。\n"
                        "仿射插值会把 0/255 变成中间灰度, 不重新二值化就找不到\n"
                        "精确的“0→255 上升沿”, 结果是边界检测失败、整颗靶标的位全为 0 —— \n"
-                       "解不出 ID 时这个值最值得先试。"),
+                       "解不出 ID 时这个值最值得先试(100~170 扫描)。\n"
+                       "只有短/长轴 < 0.965 的倾斜靶标才拉正, 正视图靶标不使用这个值。"),
         1, 254, &DetectorParams::rectifyBinThr);
     addIntField(fDec, QStringLiteral("bitSubHitThr"), QStringLiteral("子块命中点数"),
-        QStringLiteral("每个 8° 子块里亮点数超过该值才算这个子块“亮”(默认 4, 共 8 个采样角)。\n"
+        QStringLiteral("每个 8° 子块里亮点数“严格大于”该值才算这个子块“亮”\n"
+                       "(默认 4, 共 8 个采样角, 有效范围只有 0~7)。\n"
                        "调低 → 更容易把一个块读成亮(1); 调高 → 更容易读成暗(0)。"),
         0, 7, &DetectorParams::bitSubHitThr);
     addIntField(fDec, QStringLiteral("bitBlockThr"), QStringLiteral("位判定块数"),
         QStringLiteral("每个 24° 编码位分成 3 个子块, 至少这么多块亮才把该位读成 1\n"
-                       "(默认 2)。改成 3 → 必须全亮才算 1, 解码更严但更容易漏位。"),
+                       "(默认 2 = 多数表决)。改成 3 → 必须全亮才算 1, 解码更严但容易漏位;\n"
+                       "改成 1 → 只要一块亮就算 1, 更容易把黑块读成白。"),
         0, 3, &DetectorParams::bitBlockThr);
     addDoubleField(fDec, QStringLiteral("minGapRadii"), QStringLiteral("去重中心距倍数"),
-        QStringLiteral("两个候选中心的距离小于该值×半径时视为同一物理靶标, 按黑白占比\n"
-                       "与白色面积取舍(默认 10.0)。出现“同一靶标被识别成两个 ID”时\n"
-                       "适当调大。"),
+        QStringLiteral("两个候选中心的距离小于“该值 × 两者中较小的半径”时视为同一物理靶标,\n"
+                       "按白占比与白色面积取舍(默认 10.0)。\n"
+                       "出现“同一靶标被识别成两个 ID”时调大(12~15); \n"
+                       "相邻很近的靶标被误合并时调小(5~8)。"),
         1.0, 1000.0, 1, &DetectorParams::minGapRadii);
 
     // 分组之下留一点空白, 让最后一个卡片不贴边
@@ -664,6 +754,12 @@ void testDetect::buildParamPane(QWidget* paramPane)
     btns->addWidget(m_btnResetParams, 0, 1);
     btns->addWidget(m_btnSaveParams, 1, 0);
     btns->addWidget(m_btnLoadParams, 1, 1);
+    // 高级参数入口。默认用户只会看到一个需要密码的按钮, 不知道密码就打不开
+    // 亚像素精化 / 解码与去重两组, 也看不到前两组里的高级项。
+    m_btnUnlock = new QPushButton(QStringLiteral("高级参数…"), paramPane);
+    m_btnUnlock->setToolTip(QStringLiteral("输入密码后显示全部 32 项参数。\n"
+                                           "默认用户只需调上面那几项常用参数。"));
+    btns->addWidget(m_btnUnlock, 2, 0, 1, 2);
     v->addLayout(btns);
 
     m_paramHint = new QLabel(paramPane);
@@ -674,6 +770,7 @@ void testDetect::buildParamPane(QWidget* paramPane)
     connect(m_btnResetParams, &QPushButton::clicked, this, &testDetect::onResetParams);
     connect(m_btnSaveParams, &QPushButton::clicked, this, &testDetect::onSaveParamsFile);
     connect(m_btnLoadParams, &QPushButton::clicked, this, &testDetect::onLoadParamsFile);
+    connect(m_btnUnlock, &QPushButton::clicked, this, &testDetect::onUnlockAdvanced);
 
     // 初值: 优先上次保存的 ini; 没有(或读不出来)就用出厂默认。
     // 两条路都要把参数真正灌进识别器 —— 光填控件不改识别器, 界面上显示的和实际用的是两回事。
@@ -684,6 +781,7 @@ void testDetect::buildParamPane(QWidget* paramPane)
     }
     setParamsDirty(false);
     updateParamDependents();
+    applyParamVisibility();      // 启动时是锁定状态: 只露出默认用户该看到的那几项
 }
 
 DetectorParams testDetect::collectParams() const
@@ -712,6 +810,17 @@ void testDetect::onParamEdited()
 {
     if (m_updatingParams)
         return;
+    // 记住这次改动是否落在默认用户可见的项上: 收起高级参数时会丢弃高级项上
+    // 尚未应用的改动, 但常用项的改动必须保留, 提示状态也要据此重算。
+    if (QWidget* w = qobject_cast<QWidget*>(sender())) {
+        for (const ParamField& f : m_fields) {
+            if (f.w == w) {
+                if (f.basic)
+                    m_basicDirty = true;
+                break;
+            }
+        }
+    }
     setParamsDirty(true);
     updateParamDependents();      // 总开关一改, 被它压住的那几行要跟着变灰/变亮
 }
@@ -719,6 +828,8 @@ void testDetect::onParamEdited()
 void testDetect::setParamsDirty(bool dirty)
 {
     m_paramsDirty = dirty;
+    if (!dirty)
+        m_basicDirty = false;     // 已应用/已回滚: 常用项的未应用改动也一并清零
     if (m_paramHint) {
         m_paramHint->setText(dirty
             ? QStringLiteral("参数已改动，点「应用参数」生效")
@@ -748,6 +859,91 @@ void testDetect::updateParamDependents()
     }
 }
 
+// ---------------------------------------------------------------- 参数权限
+//
+// 默认用户只看到 kBasic 里那几项; 其余(含亚像素精化 / 解码与去重整两组)要密码才显示。
+// 锁定不只是"看不见", 还必须在数据层面挡住三条旁路:
+//   ① 载入参数文件时忽略高级键;
+//   ② 恢复默认时只重置可见项;
+//   ③ 收起时丢弃尚未应用的高级改动, 免得之后被默认用户的"应用"顺手带进去。
+void testDetect::setAdvancedUnlocked(bool on)
+{
+    if (m_advancedUnlocked == on)
+        return;
+    m_advancedUnlocked = on;
+
+    if (!on) {
+        // 收起 = 放弃未应用的高级改动, 回到识别器里真正在用的那套值。
+        const DetectorParams cur = m_detector.params();
+        m_updatingParams = true;
+        for (const ParamField& f : m_fields) {
+            if (!f.basic && f.w)
+                setWidgetValue(f.w, f.read(cur));
+        }
+        m_updatingParams = false;
+
+        // 只保留常用项上的未应用改动; 高级项上刚被丢弃的改动不再算数。
+        setParamsDirty(m_basicDirty);
+    }
+
+    if (m_btnUnlock) {
+        m_btnUnlock->setText(on ? QStringLiteral("收起高级参数")
+                                : QStringLiteral("高级参数…"));
+    }
+    applyParamVisibility();
+    updateParamDependents();     // 解锁后才可见的亚像素组要按总开关重新算联动禁用
+
+    statusBar()->showMessage(on
+        ? QStringLiteral("高级参数已解锁 —— 修改后记得点「应用参数」")
+        : QStringLiteral("高级参数已收起（未应用的改动已放弃）"));
+}
+
+void testDetect::applyParamVisibility()
+{
+    // 整组: 亚像素精化 / 解码与去重 的所有项都是高级参数
+    if (m_groupSubpixel)
+        m_groupSubpixel->setVisible(m_advancedUnlocked);
+    if (m_groupDecode)
+        m_groupDecode->setVisible(m_advancedUnlocked);
+
+    // 单个字段: 高级项连同 QFormLayout 自动生成的标签一起隐藏。
+    // QFormLayout 会跳过空行, 所以锁定状态下不会留下一条条空白。
+    for (const ParamField& f : m_fields) {
+        if (!f.w)
+            continue;
+        const bool vis = f.basic || m_advancedUnlocked;
+        f.w->setVisible(vis);
+        if (f.group) {
+            if (QFormLayout* form = qobject_cast<QFormLayout*>(f.group->layout())) {
+                if (QWidget* lbl = form->labelForField(f.w))
+                    lbl->setVisible(vis);
+            }
+        }
+    }
+}
+
+void testDetect::onUnlockAdvanced()
+{
+    // 已解锁时点按钮只是收起, 不再要密码
+    if (m_advancedUnlocked) {
+        setAdvancedUnlocked(false);
+        return;
+    }
+
+    bool ok = false;
+    const QString pwd = QInputDialog::getText(this, QStringLiteral("高级参数"),
+        QStringLiteral("请输入高级参数密码："), QLineEdit::Password,
+        QString(), &ok);
+    if (!ok)
+        return;
+    if (!verifyAdvancedPassword(pwd)) {
+        QMessageBox::warning(this, QStringLiteral("密码错误"),
+            QStringLiteral("密码不正确，高级参数未解锁。"));
+        return;
+    }
+    setAdvancedUnlocked(true);
+}
+
 void testDetect::onApplyParams()
 {
     const DetectorParams wanted = collectParams();
@@ -767,13 +963,24 @@ void testDetect::onApplyParams()
 
 void testDetect::onResetParams()
 {
-    const DetectorParams def = TargetDetector::defaultParams();
+    DetectorParams def = TargetDetector::defaultParams();
+    // 锁定状态下「恢复默认」只重置默认用户看得到的参数: 高级项沿用当前生效值。
+    // 否则这个按钮就成了绕过密码修改高级参数的入口。
+    if (!m_advancedUnlocked) {
+        const DetectorParams cur = m_detector.params();
+        for (const ParamField& f : m_fields) {
+            if (!f.basic)
+                f.write(def, f.read(cur));
+        }
+    }
     loadParamsToWidgets(def);
     m_detector.setParams(def);
     updateParamDependents();
     saveParamsIni();          // 默认值也落盘, 否则下次启动又会读回旧的那套
     setParamsDirty(false);
-    statusBar()->showMessage(QStringLiteral("参数已恢复默认并应用"));
+    statusBar()->showMessage(m_advancedUnlocked
+        ? QStringLiteral("参数已恢复默认并应用")
+        : QStringLiteral("常用参数已恢复默认并应用（高级参数保持不变）"));
 }
 
 // ---------------------------------------------------------------- 参数持久化
@@ -866,15 +1073,30 @@ void testDetect::onLoadParamsFile()
             QStringLiteral("这个文件里没有可用的参数(期望 [detectParams] 分组):\n%1").arg(path));
         return;
     }
+    // 锁定状态下参数文件只对常用项生效: 高级键一律沿用当前生效值,
+    // 免得"载入一个 ini"成为绕过密码修改内部参数的入口。
+    if (!m_advancedUnlocked) {
+        const DetectorParams cur = m_detector.params();
+        for (const ParamField& f : m_fields) {
+            if (!f.basic)
+                f.write(p, f.read(cur));
+        }
+    }
     loadParamsToWidgets(p);
     m_detector.setParams(p);
     loadParamsToWidgets(m_detector.params());
     updateParamDependents();
     saveParamsIni();              // 载入即视为当前配置, 一并写进自动记住的那份
     setParamsDirty(false);
-    statusBar()->showMessage(m_markers.isEmpty()
-        ? QStringLiteral("参数已载入：%1").arg(QFileInfo(path).fileName())
-        : QStringLiteral("参数已载入：%1 —— 点「开始识别编码片」或「识别标记点」重新识别").arg(QFileInfo(path).fileName()));
+    const QString name = QFileInfo(path).fileName();
+    if (m_markers.isEmpty()) {
+        statusBar()->showMessage(m_advancedUnlocked
+            ? QStringLiteral("参数已载入：%1").arg(name)
+            : QStringLiteral("参数已载入：%1（高级参数保持不变）").arg(name));
+    }
+    else {
+        statusBar()->showMessage(QStringLiteral("参数已载入：%1 —— 点「开始识别编码片」或「识别标记点」重新识别").arg(name));
+    }
 }
 
 // ---------------------------------------------------------------- 全屏
