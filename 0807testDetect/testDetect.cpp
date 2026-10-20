@@ -52,7 +52,7 @@
 namespace {
 
 
-// fontPx 是**屏幕像素**字号 —— 标签图元带 ItemIgnoresTransformations(见 finishDetect),
+// fontPx 是**屏幕像素**字号 —— 标签图元带 ItemIgnoresTransformations(见 finishDetect)
 // 尺寸不随视图缩放变化, 所以放大看亚像素轮廓时标签不会膨胀成一块招牌挡住画面。
 // 开头的 <br> 把文字压到锚点下方一行, 免得正好盖住要观察的轮廓。
 // marker=true 时显示 M1/M2...(标记点没有编码 ID, id 只是本次结果里的序号), 否则沿用 ID:n。
