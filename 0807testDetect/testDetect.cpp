@@ -54,8 +54,8 @@ namespace {
 
 // fontPx 是**屏幕像素**字号 —— 标签图元带 ItemIgnoresTransformations(见 finishDetect)
 // 尺寸不随视图缩放变化, 所以放大看亚像素轮廓时标签不会膨胀成一块招牌挡住画面。
-// 开头的 <br> 把文字压到锚点下方一行, 免得正好盖住要观察的轮廓。
-// marker=true 时显示 M1/M2...(标记点没有编码 ID, id 只是本次结果里的序号), 否则沿用 ID:n。
+// 开头的 <br> 把文字压到锚点下方一行, 免得正好盖住要观察的轮廓
+// marker=true 时显示 M1/M2...(标记点没有编码 ID, id 只是本次结果里的序号), 否则沿用 ID:n
 QString idLabelHtml(int id, bool highlight, double fontPx, bool marker = false)
 {
     const QString bg = highlight ? QStringLiteral("rgba(216,40,40,235)")
@@ -132,7 +132,7 @@ testDetect::~testDetect()
         m_mmPanel = nullptr;
     }
 
-    // 这里**故意不调用 FreeLibrary**, 让 MergeMarksLib.dll 及其依赖留到进程退出时由系统回收。
+ 
     //
     // FreeLibrary(MergeMarksLib.dll) 会让它的引用计数归零, 加载器随即连锁卸载它那一大批
     // 依赖(pcl_*_debug.dll、vtk*_d.dll、vtkGUISupportQt-8.1_d.dll ...), 而 VTK 并不支持
