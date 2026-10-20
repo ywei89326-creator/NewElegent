@@ -21,6 +21,7 @@
 #include <QByteArray>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
@@ -57,6 +58,7 @@
 #include <QSplitter>
 #include <QStatusBar>
 #include <QTabWidget>
+#include <QTextStream>
 #include <QThread>
 #include <QVBoxLayout>
 #include <QWheelEvent>
@@ -137,6 +139,9 @@ testDetect::~testDetect()
         m_mmDestroy(m_mmPanel);
         m_mmPanel = nullptr;
     }
+
+    // 撤销记录里的图元已移出 scene, 不会被 scene 析构回收, 需手动释放。
+    clearUndoStack();
 
     // ⚠ 刻意不调用 FreeLibrary(m_mmModule):
     // 它会连锁卸载 PCL/VTK 依赖, 而 VTK 不支持进程内卸载 —— vtkObjectFactory 注册表
@@ -248,6 +253,23 @@ void testDetect::buildUi()
     rl->addLayout(listHeader);
     rl->addWidget(m_list, 1);
 
+    // 撤销/导出放在列表下方, 避免标题行在最小宽度下过挤。
+    m_btnUndo = new QPushButton(QStringLiteral("撤销"), central);
+    m_btnUndo->setToolTip(QStringLiteral("撤销上一次删除操作。"));
+    m_btnUndo->setEnabled(false);
+    m_btnExport = new QPushButton(QStringLiteral("导出"), central);
+    m_btnExport->setToolTip(QStringLiteral(
+        "把当前剩余结果导出为 txt(ID、X/Y 坐标、面积、拟合质量等)。"));
+    m_btnExport->setEnabled(false);
+
+    QHBoxLayout* listActions = new QHBoxLayout();
+    listActions->setContentsMargins(0, 0, 0, 0);
+    listActions->setSpacing(6);
+    listActions->addWidget(m_btnUndo);
+    listActions->addWidget(m_btnExport);
+    listActions->addStretch(1);
+    rl->addLayout(listActions);
+
     // —— 右下: 参数设置 ——
     QWidget* paramPane = new QWidget(central);
     buildParamPane(paramPane);
@@ -300,6 +322,8 @@ void testDetect::buildUi()
     connect(m_list, &QListWidget::itemChanged, this, &testDetect::onItemChanged);
     connect(m_list, &QListWidget::itemClicked, this, &testDetect::onItemClicked);
     connect(m_btnRemoveNoise, &QPushButton::clicked, this, &testDetect::onRemoveNoise);
+    connect(m_btnUndo, &QPushButton::clicked, this, &testDetect::onUndo);
+    connect(m_btnExport, &QPushButton::clicked, this, &testDetect::onExportResults);
     m_list->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_list, &QListWidget::customContextMenuRequested,
         this, &testDetect::onListContextMenu);
@@ -1245,6 +1269,8 @@ void testDetect::finishDetect(const std::vector<DetectionResult>& results)
         mk.isMarker = m_markerMode;
         mk.pos = QPointF(r.center.x, r.center.y);
         mk.subpixel = r.subpixel;
+        mk.rms = r.rms;
+        mk.nPoints = r.nPoints;
         // 几何描述取实际绘制的轮廓: 有拟合椭圆用椭圆, 否则用圆。
         if (r.hasEllipse && r.ellipse.size.width > 0 && r.ellipse.size.height > 0) {
             const double w = r.ellipse.size.width;
@@ -1309,8 +1335,7 @@ void testDetect::finishDetect(const std::vector<DetectionResult>& results)
     m_updatingList = false;
 
     updateResultTitle();
-    if (m_btnRemoveNoise)
-        m_btnRemoveNoise->setEnabled(!m_markers.isEmpty());
+    updateResultButtons();
 
     applyHighlights();
     setBusy(false);
@@ -1350,6 +1375,7 @@ void testDetect::updateResultTitle()
 }
 
 // 行号与 m_markers 下标一一对应。从大到小删除, 前面行的下标不会失效。
+// 被删的图元只从 scene 摘除、列表项只 takeItem, 都留在撤销记录里。
 int testDetect::removeMarkerRows(QVector<int> rows)
 {
     if (rows.isEmpty() || m_markers.isEmpty())
@@ -1358,17 +1384,28 @@ int testDetect::removeMarkerRows(QVector<int> rows)
     std::sort(rows.begin(), rows.end(), std::greater<int>());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
 
+    UndoOp op;
     int removed = 0;
     m_updatingList = true;
     for (int row : rows) {
         if (row < 0 || row >= m_markers.size() || row >= m_list->count())
             continue;
 
-        delete m_markers[row].contour;   // 析构时自动从 scene 摘除
-        delete m_markers[row].dot;
-        delete m_markers[row].label;
+        RemovedRow rec;
+        rec.index = row;
+        rec.marker = m_markers[row];
+        rec.item = m_list->takeItem(row);
+
+        // 摘除但不销毁: 撤销时 addItem 原样加回。
+        if (rec.marker.contour)
+            m_scene->removeItem(rec.marker.contour);
+        if (rec.marker.dot)
+            m_scene->removeItem(rec.marker.dot);
+        if (rec.marker.label)
+            m_scene->removeItem(rec.marker.label);
+
+        op.rows.push_back(rec);
         m_markers.remove(row);
-        delete m_list->takeItem(row);
 
         // 保持"列表行号 == m_markers 下标"的不变量。
         for (int r = row; r < m_list->count(); ++r)
@@ -1377,20 +1414,142 @@ int testDetect::removeMarkerRows(QVector<int> rows)
     }
     m_updatingList = false;
 
-    m_pressedItem = nullptr;
-    // 结果被删空时退出画框模式, 并同步依赖结果的按钮状态。
-    if (m_btnRoi) {
-        if (m_markers.isEmpty() && m_roiMode)
-            m_btnRoi->setChecked(false);
-        m_btnRoi->setEnabled(!m_markers.isEmpty());
+    if (!op.rows.isEmpty()) {
+        m_undoStack.push_back(op);
+        // 限制撤销深度; 超出时销毁最旧的记录(图元不在 scene 里, 必须手动删)。
+        while (m_undoStack.size() > 20) {
+            UndoOp old = m_undoStack.takeFirst();
+            for (const RemovedRow& rec : old.rows) {
+                delete rec.marker.contour;
+                delete rec.marker.dot;
+                delete rec.marker.label;
+                delete rec.item;
+            }
+        }
     }
-    if (m_btnClear)
-        m_btnClear->setEnabled(!m_markers.isEmpty());
-    if (m_btnRemoveNoise)
-        m_btnRemoveNoise->setEnabled(!m_markers.isEmpty());
+
+    m_pressedItem = nullptr;
+    if (m_markers.isEmpty() && m_roiMode)
+        m_btnRoi->setChecked(false);
     updateResultTitle();
+    updateResultButtons();
     applyHighlights();
     return removed;
+}
+
+void testDetect::clearUndoStack()
+{
+    for (const UndoOp& op : m_undoStack) {
+        for (const RemovedRow& rec : op.rows) {
+            delete rec.marker.contour;
+            delete rec.marker.dot;
+            delete rec.marker.label;
+            delete rec.item;
+        }
+    }
+    m_undoStack.clear();
+}
+
+void testDetect::updateResultButtons()
+{
+    const bool has = !m_markers.isEmpty() && !m_busy;
+    if (m_btnRemoveNoise)
+        m_btnRemoveNoise->setEnabled(has);
+    if (m_btnUndo)
+        m_btnUndo->setEnabled(!m_undoStack.isEmpty() && !m_busy);
+    if (m_btnExport)
+        m_btnExport->setEnabled(has);
+    if (m_btnRoi)
+        m_btnRoi->setEnabled(has);
+    if (m_btnClear)
+        m_btnClear->setEnabled(has);
+}
+
+void testDetect::onUndo()
+{
+    if (m_busy || m_undoStack.isEmpty())
+        return;
+
+    UndoOp op = m_undoStack.takeLast();
+    // 删除时是从大到小处理的, 恢复必须从小到大插回, 记录里的下标才仍然有效。
+    std::sort(op.rows.begin(), op.rows.end(),
+        [](const RemovedRow& a, const RemovedRow& b) { return a.index < b.index; });
+
+    m_updatingList = true;
+    for (const RemovedRow& rec : op.rows) {
+        const int idx = qBound(0, rec.index, m_markers.size());
+        m_markers.insert(idx, rec.marker);
+        m_list->insertItem(idx, rec.item);
+        if (rec.marker.contour)
+            m_scene->addItem(rec.marker.contour);
+        if (rec.marker.dot)
+            m_scene->addItem(rec.marker.dot);
+        if (rec.marker.label)
+            m_scene->addItem(rec.marker.label);
+    }
+    for (int r = 0; r < m_list->count(); ++r)
+        m_list->item(r)->setData(Qt::UserRole, r);
+    m_updatingList = false;
+
+    m_pressedItem = nullptr;
+    updateResultTitle();
+    updateResultButtons();
+    applyHighlights();
+    statusBar()->showMessage(QStringLiteral("已撤销：恢复 %1 个结果").arg(op.rows.size()));
+}
+
+void testDetect::onExportResults()
+{
+    if (m_markers.isEmpty())
+        return;
+
+    QString path = QFileDialog::getSaveFileName(this, QStringLiteral("导出识别结果"),
+        QStringLiteral("detected_points.txt"),
+        QStringLiteral("文本文件 (*.txt);;所有文件 (*.*)"));
+    if (path.isEmpty())
+        return;
+    if (QFileInfo(path).suffix().isEmpty())
+        path += QStringLiteral(".txt");
+
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, QStringLiteral("导出失败"),
+            QStringLiteral("无法写入文件：\n%1\n\n%2").arg(path, f.errorString()));
+        return;
+    }
+
+    // UTF-8 BOM: 中文系统上的记事本/Excel 能正确识别编码。
+    f.write("\xEF\xBB\xBF");
+    QTextStream out(&f);
+    out.setCodec("UTF-8");
+
+    out << QStringLiteral("# 靶标识别结果\n");
+    out << QStringLiteral("# 导出时间: ")
+        << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")) << '\n';
+    out << QStringLiteral("# 坐标单位: 像素(去畸变图像坐标系)\n");
+    out << QStringLiteral("# 类型\tID\tX\tY\t面积(平方像素)\t长短轴比\t亚像素\tRMS(px)\t点数\n");
+
+    for (const Marker& mk : m_markers) {
+        out << (mk.isMarker ? QStringLiteral("标记点") : QStringLiteral("编码片")) << '\t'
+            << mk.id << '\t'
+            << QString::number(mk.pos.x(), 'f', 3) << '\t'
+            << QString::number(mk.pos.y(), 'f', 3) << '\t'
+            << QString::number(mk.area, 'f', 1) << '\t'
+            << QString::number(mk.aspect, 'f', 2) << '\t'
+            << (mk.subpixel ? QStringLiteral("是") : QStringLiteral("否")) << '\t'
+            << (mk.subpixel ? QString::number(mk.rms, 'f', 3) : QStringLiteral("-")) << '\t'
+            << (mk.subpixel ? QString::number(mk.nPoints) : QStringLiteral("-")) << '\n';
+    }
+    out.flush();
+    f.close();
+
+    if (f.error() != QFileDevice::NoError) {
+        QMessageBox::warning(this, QStringLiteral("导出失败"),
+            QStringLiteral("写入文件时出错：\n%1\n\n%2").arg(path, f.errorString()));
+        return;
+    }
+    statusBar()->showMessage(QStringLiteral("已导出 %1 个结果：%2")
+        .arg(m_markers.size()).arg(path));
 }
 
 void testDetect::onListContextMenu(const QPoint& pos)
@@ -1758,6 +1917,7 @@ bool testDetect::eventFilter(QObject* watched, QEvent* event)
 
 void testDetect::clearResults()
 {
+    clearUndoStack();
     for (const Marker& mk : m_markers) {
         delete mk.contour;  // 析构时自动从 scene 摘除
         delete mk.dot;
@@ -1775,8 +1935,7 @@ void testDetect::clearResults()
         m_roiItem->setPolygon(QPolygonF());
         m_roiItem->setVisible(false);
     }
-    if (m_btnRemoveNoise)
-        m_btnRemoveNoise->setEnabled(false);
+    updateResultButtons();
     if (m_listTitle)
         m_listTitle->setText(QStringLiteral("识别结果"));
 }
@@ -1788,10 +1947,7 @@ void testDetect::setBusy(bool busy)
     m_btnDetect->setEnabled(!busy && m_hasImage);
     m_btnDetectMarkers->setEnabled(!busy && m_hasImage);
     m_btnFit->setEnabled(!busy);
-    m_btnRoi->setEnabled(!busy && !m_markers.isEmpty());
-    m_btnClear->setEnabled(!busy && !m_markers.isEmpty());
-    if (m_btnRemoveNoise)
-        m_btnRemoveNoise->setEnabled(!busy && !m_markers.isEmpty());
+    updateResultButtons();
     // 识别期间禁用整栏: 参数本身有快照保护, 但禁掉可避免"本次用的哪套参数"说不清。
     if (m_paramPane)
         m_paramPane->setEnabled(!busy);

@@ -72,6 +72,8 @@ private slots:
     void onItemClicked(QListWidgetItem* item);
     void onListContextMenu(const QPoint& pos);   // 右键删除单个结果
     void onRemoveNoise();                        // 按轮廓面积批量删除干扰点
+    void onUndo();                               // 撤销上一次删除
+    void onExportResults();                      // 导出剩余结果到 txt
     void onClearSelection();
     void onFitView();
     void onTabChanged(int index);
@@ -93,9 +95,22 @@ private:
         double major = 0.0;                     // 长半轴(px)
         double aspect = 1.0;                    // 短轴/长轴, 圆为 1
         bool subpixel = true;                   // false = 中心退回了整数轮廓, 不是亚像素的
+        float rms = 0.f;                        // 拟合残差(仅供参考, 非标定精度)
+        int nPoints = 0;                        // 参与拟合的点数
         QGraphicsPathItem* contour = nullptr;   // 亚像素拟合轮廓(倾斜时是椭圆)
         QGraphicsEllipseItem* dot = nullptr;    // 亚像素中心点
         QGraphicsTextItem* label = nullptr;
+    };
+
+    // 撤销记录: 删除时把图元从 scene 摘除但不销毁, 列表项也 takeItem 保留,
+    // 撤销时按原下标插回即可, 无需重建图形。
+    struct RemovedRow {
+        int index = -1;
+        Marker marker;
+        QListWidgetItem* item = nullptr;
+    };
+    struct UndoOp {
+        QVector<RemovedRow> rows;
     };
 
     void buildUi();
@@ -107,8 +122,10 @@ private:
     void updateResultTitle();                             // 标题里的结果计数
     void updateZoomLabel();
     void setBusy(bool busy);
-    // 按列表行号删除结果(行号与 m_markers 下标一一对应), 同步删除图元并重排索引。
+    // 按列表行号删除结果(行号与 m_markers 下标一一对应), 记录撤销信息并重排索引。
     int removeMarkerRows(QVector<int> rows);
+    void clearUndoStack();                                // 丢弃撤销记录并销毁被摘除的图元
+    void updateResultButtons();                           // 撤销/导出/删除等结果相关按钮的可用状态
 
     // ---- 参数设置栏 ----
     void buildParamPane(QWidget* paramPane);
@@ -163,7 +180,10 @@ private:
     QGraphicsPolygonItem* m_roiItem = nullptr;
     QListWidget* m_list = nullptr;
     QLabel* m_listTitle = nullptr;
-    QPushButton* m_btnRemoveNoise = nullptr;   // 【删除干扰点】按面积阈值批量删除
+    QPushButton* m_btnRemoveNoise = nullptr;   // 【删除干扰点】模板匹配批量删除
+    QPushButton* m_btnUndo = nullptr;          // 【撤销】恢复上一次删除
+    QPushButton* m_btnExport = nullptr;        // 【导出】当前剩余结果 -> txt
+    QVector<UndoOp> m_undoStack;               // 删除操作的撤销记录(仅本次识别有效)
     QLabel* m_zoomLabel = nullptr;   // 状态栏右侧常驻的缩放比例
 
     // ---- 参数设置栏 ----
