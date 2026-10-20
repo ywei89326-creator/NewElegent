@@ -14,7 +14,7 @@
 //
 // ⚠ 必须在窗口 show() 之前设好: MergeMarksLib 面板是切到「点云拼接」页才创建的
 // (懒加载), 届时样式表已经装在 QApplication 上, 面板控件创建时就自动套用,
-// 于是两个页签是同一套主题 —— 这也是「一处定义、两个页签统一」的原理。
+// 于是两个页签是同一套主题 —— 这也是「一处定义、两个页签统一」的原理
 static void applyDarkTechTheme(QApplication& app)
 {
     app.setStyle(QStyleFactory::create(QStringLiteral("Fusion")));
