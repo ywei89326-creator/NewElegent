@@ -89,7 +89,9 @@ private:
         int id = -1;
         bool isMarker = false;                  // true = 标记点模式(标签显示 M1..Mn, id 是序号)
         QPointF pos;
-        double area = 0.0;                      // 轮廓面积(拟合椭圆/圆), px²
+        double area = 0.0;                      // 轮廓面积(拟合椭圆/圆), 平方像素
+        double major = 0.0;                     // 长半轴(px)
+        double aspect = 1.0;                    // 短轴/长轴, 圆为 1
         bool subpixel = true;                   // false = 中心退回了整数轮廓, 不是亚像素的
         QGraphicsPathItem* contour = nullptr;   // 亚像素拟合轮廓(倾斜时是椭圆)
         QGraphicsEllipseItem* dot = nullptr;    // 亚像素中心点

@@ -20,6 +20,9 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QCheckBox>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -227,8 +230,8 @@ void testDetect::buildUi()
     // 标题行右侧: 按面积批量删除误识别的小圈, 无结果时禁用。
     m_btnRemoveNoise = new QPushButton(QStringLiteral("删除干扰点"), central);
     m_btnRemoveNoise->setToolTip(QStringLiteral(
-        "按轮廓面积批量删除误识别的小圈。\n"
-        "点击后输入面积阈值, 轮廓面积低于该值的识别结果全部删除。"));
+        "选一个正确识别的点作为模板, 删除与它轮廓面积/形状相差较大的结果。\n"
+        "点击后在弹窗中选择模板并调整允许偏差。"));
     m_btnRemoveNoise->setEnabled(false);
 
     QHBoxLayout* listHeader = new QHBoxLayout();
@@ -1242,13 +1245,18 @@ void testDetect::finishDetect(const std::vector<DetectionResult>& results)
         mk.isMarker = m_markerMode;
         mk.pos = QPointF(r.center.x, r.center.y);
         mk.subpixel = r.subpixel;
-        // 面积取实际绘制的轮廓: 有拟合椭圆用椭圆面积, 否则用圆面积。
+        // 几何描述取实际绘制的轮廓: 有拟合椭圆用椭圆, 否则用圆。
         if (r.hasEllipse && r.ellipse.size.width > 0 && r.ellipse.size.height > 0) {
-            mk.area = CV_PI * (r.ellipse.size.width * 0.5) * (r.ellipse.size.height * 0.5);
+            const double w = r.ellipse.size.width;
+            const double h = r.ellipse.size.height;
+            mk.major = qMax(w, h) * 0.5;
+            mk.aspect = (mk.major > 0.0) ? qMin(w, h) / qMax(w, h) : 1.0;
+            mk.area = CV_PI * (w * 0.5) * (h * 0.5);
         }
         else {
-            const double rr = qMax((double)r.radius, 1.0);
-            mk.area = CV_PI * rr * rr;
+            mk.major = qMax((double)r.radius, 1.0);
+            mk.aspect = 1.0;
+            mk.area = CV_PI * mk.major * mk.major;
         }
 
         // 优先画亚像素椭圆, 退化时按圆。
@@ -1407,37 +1415,122 @@ void testDetect::onRemoveNoise()
 {
     if (m_busy || m_markers.isEmpty())
         return;
-
-    // 默认阈值取面积中位数的一半, 通常落在真靶标与误识别小圈之间。
-    QVector<double> areas;
-    areas.reserve(m_markers.size());
-    for (const Marker& mk : m_markers)
-        areas.push_back(mk.area);
-    std::sort(areas.begin(), areas.end());
-    const double median = areas[areas.size() / 2];
-    const double suggested = qMax(0.0, std::round(median * 0.5 * 10.0) / 10.0);
-
-    bool ok = false;
-    const double thr = QInputDialog::getDouble(this, QStringLiteral("删除干扰点"),
-        QStringLiteral("轮廓面积小于该值的识别结果将被删除（单位：平方像素）。\n"
-                       "默认值为当前面积中位数的一半，可按列表里的面积调整："),
-        suggested, 0.0, 1.0e9, 1, &ok);
-    if (!ok)
+    if (m_markers.size() < 2) {
+        statusBar()->showMessage(QStringLiteral("至少需要 2 个识别结果才能按模板筛选"));
         return;
+    }
 
-    QVector<int> rows;
+    // ---- 模板选择 + 偏差设置(实时预览保留/删除数量) ----
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("删除干扰点 · 模板匹配"));
+
+    QVBoxLayout* lay = new QVBoxLayout(&dlg);
+    lay->setSpacing(8);
+
+    QLabel* tip = new QLabel(QStringLiteral(
+        "选择一个识别正确、有代表性的结果作为模板。\n"
+        "轮廓面积和长短轴比都与模板接近的结果保留，相差较大的删除。"), &dlg);
+    tip->setWordWrap(true);
+    lay->addWidget(tip);
+
+    QComboBox* combo = new QComboBox(&dlg);
+    combo->setMinimumWidth(460);
+    combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    combo->setMinimumContentsLength(24);
     for (int i = 0; i < m_markers.size(); ++i) {
-        if (m_markers[i].area < thr)
-            rows.push_back(i);
+        const Marker& mk = m_markers[i];
+        const QString head = m_markerMode
+            ? QStringLiteral("M%1").arg(mk.id)
+            : QStringLiteral("ID:%1").arg(mk.id);
+        combo->addItem(QStringLiteral("%1   (%2, %3)   面积 %4   长短轴比 %5")
+            .arg(head)
+            .arg(mk.pos.x(), 0, 'f', 3)
+            .arg(mk.pos.y(), 0, 'f', 3)
+            .arg(mk.area, 0, 'f', 1)
+            .arg(mk.aspect, 0, 'f', 2));
     }
-    if (rows.isEmpty()) {
-        statusBar()->showMessage(QStringLiteral("没有面积小于 %1平方像素 的结果").arg(thr, 0, 'f', 1));
+    lay->addWidget(combo);
+
+    QHBoxLayout* tolRow = new QHBoxLayout();
+    tolRow->addWidget(new QLabel(QStringLiteral("允许偏差："), &dlg));
+    QDoubleSpinBox* tol = new QDoubleSpinBox(&dlg);
+    tol->setRange(5.0, 95.0);
+    tol->setDecimals(0);
+    tol->setSingleStep(5.0);
+    tol->setValue(50.0);
+    tol->setSuffix(QStringLiteral(" %"));
+    tolRow->addWidget(tol);
+    tolRow->addStretch(1);
+    lay->addLayout(tolRow);
+
+    QLabel* preview = new QLabel(&dlg);
+    preview->setWordWrap(true);
+    lay->addWidget(preview);
+
+    QDialogButtonBox* bb = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    if (QPushButton* b = bb->button(QDialogButtonBox::Ok))
+        b->setText(QStringLiteral("删除"));
+    if (QPushButton* b = bb->button(QDialogButtonBox::Cancel))
+        b->setText(QStringLiteral("取消"));
+    lay->addWidget(bb);
+    connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    // 面积与长短轴比都允许相对模板 ±t 的偏差, 两项都在范围内才保留。
+    auto collectKill = [this, combo, tol]() -> QVector<int> {
+        const int ti = combo->currentIndex();
+        if (ti < 0 || ti >= m_markers.size())
+            return {};
+        const Marker& tpl = m_markers[ti];
+        const double t = tol->value() / 100.0;
+        auto close = [t](double v, double ref) {
+            if (ref <= 0.0)
+                return true;
+            return v >= ref * (1.0 - t) && v <= ref * (1.0 + t);
+        };
+        QVector<int> kill;
+        for (int i = 0; i < m_markers.size(); ++i) {
+            if (i == ti)
+                continue;
+            const Marker& mk = m_markers[i];
+            if (!close(mk.area, tpl.area) || !close(mk.aspect, tpl.aspect))
+                kill.push_back(i);
+        }
+        return kill;
+    };
+
+    auto refreshPreview = [this, combo, tol, preview, collectKill]() {
+        const int ti = combo->currentIndex();
+        if (ti < 0 || ti >= m_markers.size())
+            return;
+        const Marker& tpl = m_markers[ti];
+        const QVector<int> kill = collectKill();
+        preview->setText(QStringLiteral(
+            "模板：面积 %1，长短轴比 %2，允许偏差 ±%3%\n"
+            "保留 %4 个，删除 %5 个")
+            .arg(tpl.area, 0, 'f', 1)
+            .arg(tpl.aspect, 0, 'f', 2)
+            .arg(tol->value(), 0, 'f', 0)
+            .arg(m_markers.size() - kill.size())
+            .arg(kill.size()));
+    };
+    connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+        &dlg, [refreshPreview](int) { refreshPreview(); });
+    connect(tol, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+        &dlg, [refreshPreview](double) { refreshPreview(); });
+    refreshPreview();
+
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    const QVector<int> kill = collectKill();
+    if (kill.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("没有与模板差异过大的结果"));
         return;
     }
-
-    const int n = removeMarkerRows(rows);
-    statusBar()->showMessage(QStringLiteral("已删除 %1 个干扰点（轮廓面积 < %2平方像素）")
-        .arg(n).arg(thr, 0, 'f', 1));
+    const int n = removeMarkerRows(kill);
+    statusBar()->showMessage(QStringLiteral("已按模板删除 %1 个干扰点").arg(n));
 }
 
 
