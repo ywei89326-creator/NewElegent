@@ -110,7 +110,7 @@ The UI is built **in code** in `testDetect::buildUi()`. `testDetect.ui` is a nea
 - Detection is done by `TargetDetector` from `schneider0807.dll`, held as a member (`m_detector`) so its undistort remap tables are computed once per image size and reused.
 - ⚠ **Never** include `TargetDetector1215.h` alongside `include/TargetDetector.h`. Both define `TargetInfo` / `DetectionResult` / `TargetDetector` in the global namespace with different layouts → C2011 redefinition.
 - Detection runs on a `QThread`; results return to the GUI thread via `QMetaObject::invokeMethod(..., Qt::QueuedConnection)` into `finishCodedDetect` / `finishMarkerDetect` / `finishDetectAll`. The thread handle is a `QPointer<QThread>` because the thread `deleteLater`s itself.
-- **Coordinate-system invariant**: detection results (`DetectionResult::center`) are in the *undistorted* image frame, so the displayed pixmap must be `m_detector.undistortImage(m_srcMat)` — never `m_srcMat` directly, or every overlay shifts.
+- **Coordinate-system invariant**: detection results (`DetectionResult::center`) are in the *undistorted* image frame, so the displayed pixmap must come from `buildDisplayImage()` (= `m_detector.undistortImage(prepareDetectInput(m_srcMat))`) — never `m_srcMat` directly, or every overlay shifts. `prepareDetectInput` is pointwise (tone LUT + optional BGR2GRAY) and changes no coordinates; it must be applied *before* undistort so the display is pixel-identical to what the DLL sees (that is what makes the hover gray-value readout trustworthy).
 - `DetectionResult::subpixel` / `rms` / `nPoints` are the quality triple. `rms` is a **fit residual, not calibrated accuracy** — with a uniform point band its floor is roughly `band/√3 ≈ 0.7px`, so a large value isn't automatically bad. It's usable for *relative* comparison between runs; absolute accuracy needs a repeatability test. Non-sub-pixel results fall back to integer contour centers (~0.3px) and are drawn orange/dashed to make that visible.
 - The ROI polygon is built by sorting the checked targets by polar angle around their centroid, so it can never self-intersect regardless of click order. Checkbox selection means "highlight / participate in ROI"; the polygon is only *drawn* while 画框 mode is on.
 
@@ -137,10 +137,10 @@ The UI is built **in code** in `testDetect::buildUi()`. `testDetect.ui` is a nea
 #### 识别参数（界面上直接调）
 
 Every tuning constant of the algorithm lives in `DetectorParams` (`include/TargetDetector.h`), and the
-**参数设置** pane at the bottom right of tab 1 is its UI: 32 fields in four groups (预处理 / 轮廓筛选 /
-亚像素精化 / 解码与去重), plus one **host-side** field in a fifth group 结果过滤. Before this, every
-threshold was a hardcoded literal in `TargetDetector.cpp` and tuning one meant editing source, rebuilding
-the DLL and restarting.
+**参数设置** pane at the bottom right of tab 1 is its UI: 33 fields in five groups (预处理 / 灰度与阈值 /
+轮廓筛选 / 亚像素精化 / 解码与去重), plus **host-side** controls in three more groups (图像增强,
+结果过滤, and 灰度化 inside 灰度与阈值). Before this, every threshold was a hardcoded literal in
+`TargetDetector.cpp` and tuning one meant editing source, rebuilding the DLL and restarting.
 Per-parameter meaning, tuning direction and a symptom→parameter table live in `参数说明.md` at the
 repo root; the in-app tooltips carry the same conclusions in condensed form.
 
@@ -150,7 +150,30 @@ repo root; the in-app tooltips carry the same conclusions in condensed form.
 - The pane's widget↔parameter mapping is a single table (`m_fields` in `testDetect.h`, built by
   `addIntField`/`addDoubleField`/`addBoolField`). Read/write go through a pointer-to-member, so adding
   a parameter needs **three** coordinated edits: the header field, one clamp line in
-  `TargetDetector::setParams`, one `addXxxField` line in `buildParamPane`.
+  `TargetDetector::setParams`, one `addXxxField` line in `buildParamPane` (plus the key in
+  `isBasicParamKey` if it should be visible without the advanced password).
+- **灰度与阈值** is the only always-visible partly-host-side group. 灰度化 (`HostParams::grayscale`,
+  persisted as `grayscale`) makes `prepareDetectInput()` convert the detector input to `CV_8UC1`
+  (`BGR2GRAY`) before the DLL sees it. The display image is `undistort(prepareDetectInput(src))`
+  (`buildDisplayImage()`), i.e. exactly the image the detector processes, so the status-bar hover
+  readout (`updatePixelInfo()` via `m_viewMat` and the viewport's MouseMove event) reports the real
+  pixel gray value. 边界阈值 (`DetectorParams::boundaryThreshold`, 0 = off) is the one **DLL-side**
+  field here. With `> 0`, `refineCenters` bypasses Zernike for that candidate and calls
+  `subpixelBoundaryContour()`: threshold the local un-eroded gray at T, take the blob containing the
+  candidate, walk its boundary pixels, bilinearly sample outward along each radial to find the
+  `gray == T` crossing, 3-point circular smooth, then fit an ellipse only to get center/axes/metrics.
+  The resulting **sub-pixel isocontour** goes into `DetectionResult::contourPoints` (full-image
+  coords, closed without repeating the first point); it is what the UI draws, so every pixel `> T`
+  is inside and the curve runs between it and the next darker pixel — the correct sub-pixel reading.
+  It does **not** change the pre-processing binarization (`useOtsu`/`fixedThreshold`).
+- **All results are sub-pixel by default**: when `boundaryThreshold == 0` and both Zernike circle and
+  ellipse fits fail, `refineCenters` also calls `subpixelBoundaryContour()` with a local-Otsu threshold
+  and uses those points. Only candidates with no local boundary at all (flat/saturated patches, i.e.
+  false positives) keep the orange `(!)非亚像素` flag. The host draws `r.contourPoints` via
+  `smoothClosedPath()` (Catmull-Rom → cubic Bezier, passes through every point) and computes the list
+  area with `contourAreaOf()` (shoelace) when the contour is present; otherwise it still uses the
+  fitted ellipse. `DetectionResult::contourPoints` was added to the exported struct, so both headers,
+  lib and DLL were rebuilt together.
 - **图像增强 · 黑场/白场** (advanced-only group 图像增强) is host-side and runs **before** the image
   is handed to the DLL: `enhanceImageForDetect()` builds a 256-entry LUT
   (`out = (in-black)*255/(white-black)`, clamped) and applies `cv::LUT`. The three detection slots
@@ -302,11 +325,13 @@ These are engineered workarounds with comments explaining them — changing them
 
 - **Whole-row checkbox toggling in the result list**: `QStyledItemDelegate::editorEvent` swallows `MouseButtonPress` when the click lands on the checkbox, so `QListWidget::itemPressed` never fires. Instead `testDetect::eventFilter` records the item and its check state on press; `onItemClicked` compares against that to tell whether Qt already toggled, and only toggles itself when it didn't.
 - **`m_updatingList`** guards every programmatic list mutation to suppress `itemChanged` re-entry.
-- **Labels** (`QGraphicsTextItem`) set `ItemIgnoresTransformations` so ID tags stay a fixed screen size at any zoom; entity sizes (`m_markRadius`, `m_penW`) instead scale with image resolution in `showImage()`.
-- **Marker contour pens are cosmetic** (`applyHighlights`): 1 device px for a normal subpixel result, 1 px dashed orange for non-subpixel, 2 px red when checked. A cosmetic pen ignores the view transform, so zooming in does not thicken the outline over the very edge the user is inspecting.
+- **Labels** (`QGraphicsTextItem`) set `ItemIgnoresTransformations` so ID tags stay a fixed screen size at any zoom; entity sizes (`m_penW`) instead scale with image resolution in `showImage()`.
+- **The center dot is a fixed device-pixel point** (`createMarker`/`applyHighlights`): a `QGraphicsEllipseItem` with `ItemIgnoresTransformations`, radius 2 px (2.5 px when checked), positioned at the sub-pixel center. Because it ignores the view transform, zooming to inspect an edge does not blow it up into a blob that hides the very edge being measured. Do **not** go back to sizing it from `m_markRadius` in scene units.
+- **Marker contour pens are cosmetic** (`applyHighlights`): 1 device px for a normal subpixel result, 1 px dashed orange for non-subpixel, 2 px red when checked. A cosmetic pen ignores the view transform, so zooming in does not thicken the outline over the very edge the user is inspecting. The contour path is either a fitted ellipse or a free-form `smoothClosedPath(r.contourPoints)`; both are just `QGraphicsPathItem` paths, so the pen logic is unchanged.
 - **`m_autoFit`** goes false as soon as the user zooms manually, so a window resize stops snapping back to fit. `eventFilter`'s `Resize` branch must null-check `m_pixmapItem`: `QGraphicsView::fitInView(const QGraphicsItem*, ...)` does not, and dereferences it (crash on startup).
 - Zoom uses `pow(1.0015, delta)` with a clamped range so in/out are exact inverses; the wheel event is consumed so the view doesn't scroll.
 - **Result rows and `m_markers` are 1:1 by index.** The item's `Qt::UserRole` stores the marker index. Both right-click delete and 【删除干扰点】 go through `removeMarkerRows()`, which removes rows **from the highest index down** and rewrites `UserRole` for the rows that shift. Any new list mutation must preserve this invariant.
+- **Quality split (good / poor).** `Marker::lowQuality` is set in `createMarker()` by `isLowQualityFit()`: `!subpixel`, `aspect < 0.70`, or a normalized residual over budget (isocontour path `rms / R > 0.02`; Zernike path `rms > 1.5 × band/√3`, since that rms carries the selection-band floor). `finalizeResultMerge()` does a `std::stable_sort` putting good results first (relative order — coded before markers — is preserved) and `applyHighlights()` draws poor contours **yellow** (1.5 px; dashed when non-subpixel), good ones cyan, checked red. Poor rows are yellow in the list and their text carries `质量差`. A yellow separator above the first poor row is **painted by `QualitySeparatorDelegate`** using `kFirstPoorRole = Qt::UserRole+2` — it is not an extra list row, so the row↔marker invariant is untouched. `updateQualitySeparator()` re-marks that row after delete/undo. 【删除较差的点】(next to 【删除干扰点】, `onRemovePoor`) removes every `lowQuality` row through `removeMarkerRows()`, so it participates in undo and the deletion blacklist.
 - **Undo owns removed graphics.** `removeMarkerRows()` does **not** delete the scene items or the list item: it calls `scene->removeItem()` / `takeItem()` and stores them in `m_undoStack` (max 20 ops). `onUndo()` pops the last op and re-inserts rows **ascending** so the recorded indices stay valid. `clearUndoStack()` is the only owner of still-orphaned items and must run on a new detection (`clearResults()`) and in the destructor; forgetting it leaks, and deleting them on undo double-frees.
 - **Export** writes the remaining `m_markers` in list order to a tab-separated txt with a UTF-8 BOM (`QIODevice::Text` gives CRLF). Columns: type, ID, X, Y, area, aspect, subpixel, RMS, nPoints; coordinates are the undistorted-image frame, 3 decimals.
-- **Outline geometry** stored per result: `area` = π·(w/2)·(h/2) when `hasEllipse`, otherwise π·r²; `major` = long semi-axis; `aspect` = short/long (1 for circles). 【删除干扰点】 opens a dialog to pick one result as a template, then deletes every other result whose **area** falls outside `template × (1 ± tolerance)` (default 50%). **Aspect is deliberately not used here** (it remains in the export column and in `maxAspect` contour screening) — area alone avoids deleting real targets whose tilt/shape differs. The preview count updates live; the template is always kept.
+- **Outline geometry** stored per result: `area` = shoelace area of `contourPoints` when that contour is present, otherwise π·(w/2)·(h/2) when `hasEllipse`, otherwise π·r²; `major` = long semi-axis; `aspect` = short/long (1 for circles). 【删除干扰点】 opens a dialog to pick one result as a template, then deletes every other result whose **area** falls outside `template × (1 ± tolerance)` (default 50%). **Aspect is deliberately not used here** (it remains in the export column and in `maxAspect` contour screening) — area alone avoids deleting real targets whose tilt/shape differs. The preview count updates live; the template is always kept.

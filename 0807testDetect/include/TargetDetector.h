@@ -31,6 +31,11 @@ struct DetectionResult {
 	bool hasEllipse = false;    // true → 用 ellipse; false → 用 radius 按正圆画
 	cv::RotatedRect ellipse;    // 亚像素椭圆, 整幅图坐标
 	float radius = 0.f;         // 亚像素半径(兜底)
+	// 亚像素边界折线(整幅图坐标, 首尾不重复的闭合环)。
+	// 非空时表示该结果是按"灰度阈值边界"取的等值线: 每个点都由灰度在 T 处的
+	// 线性插值细化到亚像素, UI 直接把这一圈连成平滑曲线(比椭圆更贴合实际边界)。
+	// 空 = 用 ellipse/radius 画(默认 Zernike 路径)。
+	std::vector<cv::Point2f> contourPoints;
 
 	// ---- 质量信息: 判断这个中心到底是不是"真的亚像素" ----
 	// 亚像素精化失败时中心会退回整数轮廓拟合值(精度掉到 ~0.3px 量级), 光看 center 分辨不出来,
@@ -106,6 +111,13 @@ struct DetectorParams {
 	int    bitSubHitThr     = 4;      // 8 个采样角里亮点数须 > 该值才算命中子块(原字面量 4)
 	int    bitBlockThr      = 2;      // 3 个子块里至少命中几个才算该位为 1(原字面量 2)
 	double minGapRadii      = 10.0;   // 去重: 两中心距 < 该值×半径 视为同一靶标(原 kMinGapRadii)
+
+	// ---- 灰度边界 (refineCenters → localThresholdEllipse) ----
+	// >0: 用这个固定灰度阈值重新取候选周围的未腐蚀白斑轮廓(灰度 > 该值的像素算目标),
+	//     拟合出的椭圆必须包含这条灰度等值线 —— 亚像素椭圆比它小时按面积比放大。
+	// 0 (默认): 保持原行为, 用局部大津法自动求阈值。
+	// 注意它只作用于"拟合轮廓的边界", 不改变预处理里的二值化(那是 useOtsu/fixedThreshold)。
+	int    boundaryThreshold = 0;
 };
 
 
@@ -210,6 +222,8 @@ private:
 		std::vector<float>& validRadii,
 		std::vector<cv::RotatedRect>& validEllipses);
 
+	// refinedContours: 与其余输出一一对应的"阈值边界亚像素折线";
+	// 空 vector = 该候选没有用等值线路径(默认 Zernike, 按椭圆画)。
 	void refineCenters(const cv::Mat& gray_blur,
 		const std::vector<cv::Point2f>& centers,
 		const std::vector<float>& radii,
@@ -217,7 +231,8 @@ private:
 		std::vector<cv::Point2f>& refinedCenters,
 		std::vector<float>& refinedRadii,
 		std::vector<cv::RotatedRect>& refinedEllipses,
-		std::vector<RefineQuality>& quality, const DetectorParams& P);
+		std::vector<RefineQuality>& quality,
+		std::vector<std::vector<cv::Point2f> >& refinedContours, const DetectorParams& P);
 
 	bool decodeSingleTarget(const cv::Mat& gray_clean,
 		const cv::Point2f& center, float radius,

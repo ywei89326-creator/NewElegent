@@ -60,6 +60,7 @@
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStatusBar>
+#include <QStyledItemDelegate>
 #include <QTabWidget>
 #include <QTextStream>
 #include <QThread>
@@ -86,6 +87,34 @@ QString idLabelHtml(int id, bool highlight, double fontPx, bool marker = false)
         .arg(bg, fg, QString::number(fontPx, 'f', 0), tag);
 }
 
+// 结果列表里"质量较差"分界线的标记角色(行项目上存 bool)。
+// 与 Qt::UserRole(marker 下标)分开, 避免破坏"行号 == m_markers 下标"。
+const int kFirstPoorRole = Qt::UserRole + 2;
+
+// 在"第一条质量差的结果"上方画一条黄色分界线, 把好点/差点分成两栏。
+// 只是绘制, 不新增列表行 —— 行号与 m_markers 下标的一一对应关系保持不变。
+class QualitySeparatorDelegate : public QStyledItemDelegate
+{
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    void paint(QPainter* painter, const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override
+    {
+        QStyledItemDelegate::paint(painter, option, index);   // 先画正常行(含勾选框)
+        if (!index.data(kFirstPoorRole).toBool())
+            return;
+
+        painter->save();
+        QPen pen(QColor(255, 210, 40, 210));
+        pen.setWidth(2);
+        painter->setPen(pen);
+        const QRect r = option.rect;
+        painter->drawLine(r.left() + 6, r.top() + 1, r.right() - 6, r.top() + 1);
+        painter->restore();
+    }
+};
+
 // 亚像素轮廓路径。用圆弧段而非折线, 放大后不会出现棱角。
 // 变换按 OpenCV RotatedRect 约定构造: QTransform(m11, m12, m21, m22, dx, dy)。
 QPainterPath contourPath(const cv::RotatedRect& e)
@@ -105,6 +134,46 @@ QPainterPath contourPath(const cv::Point2f& c, double r)
     QPainterPath p;
     p.addEllipse(QPointF(c.x, c.y), r, r);
     return p;
+}
+
+// 闭合亚像素折线 -> 平滑曲线(Catmull-Rom 转三次贝塞尔)。
+// 曲线严格经过每个边界点: 点本身已经是 DLL 沿灰度等值线插值出来的亚像素位置,
+// 这里只负责把相邻点之间连得平滑, 不会把曲线拉离用户设定的边界。
+QPainterPath smoothClosedPath(const std::vector<cv::Point2f>& pts)
+{
+    QPainterPath path;
+    const int n = (int)pts.size();
+    if (n < 3)
+        return path;
+
+    path.moveTo(pts[0].x, pts[0].y);
+    for (int i = 0; i < n; ++i) {
+        const cv::Point2f& p0 = pts[(i + n - 1) % n];
+        const cv::Point2f& p1 = pts[i];
+        const cv::Point2f& p2 = pts[(i + 1) % n];
+        const cv::Point2f& p3 = pts[(i + 2) % n];
+        const QPointF c1(p1.x + (p2.x - p0.x) / 6.0, p1.y + (p2.y - p0.y) / 6.0);
+        const QPointF c2(p2.x - (p3.x - p1.x) / 6.0, p2.y - (p3.y - p1.y) / 6.0);
+        path.cubicTo(c1, c2, QPointF(p2.x, p2.y));
+    }
+    path.closeSubpath();
+    return path;
+}
+
+// 闭合折线面积(鞋带公式), 单位平方像素。
+// 阈值等值线结果用它作为列表/导出/删除模板里的"面积", 与实际画出的轮廓一致。
+double contourAreaOf(const std::vector<cv::Point2f>& pts)
+{
+    const int n = (int)pts.size();
+    if (n < 3)
+        return 0.0;
+    double a = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const cv::Point2f& p = pts[i];
+        const cv::Point2f& q = pts[(i + 1) % n];
+        a += (double)p.x * q.y - (double)q.x * p.y;
+    }
+    return std::fabs(a) * 0.5;
 }
 
 // 「编码片区域」= 编码带外沿 × 中心圆半径。中心圆之外的编码带里不会存在真正的
@@ -138,13 +207,41 @@ double dist2(const QPointF& a, const QPointF& b)
     return dx * dx + dy * dy;
 }
 
-// 与结果列表/导出里的面积口径完全一致: 有拟合椭圆用长短半轴, 否则用半径(至少 1px)。
+// 与结果列表/导出里的面积口径完全一致:
+//   阈值等值线结果 -> 实际绘制的闭合折线面积;
+//   否则有拟合椭圆用长短半轴, 再否则用半径(至少 1px)。
 double resultArea(const DetectionResult& r)
 {
+    if (r.contourPoints.size() >= 3)
+        return contourAreaOf(r.contourPoints);
     if (r.hasEllipse && r.ellipse.size.width > 0 && r.ellipse.size.height > 0)
         return CV_PI * (r.ellipse.size.width * 0.5) * (r.ellipse.size.height * 0.5);
     const double rr = qMax((double)r.radius, 1.0);
     return CV_PI * rr * rr;
+}
+
+// 质量分级: 只影响显示(黄色轮廓 + 列表沉底), 不丢弃结果。
+//   ① 非亚像素                  -> 差
+//   ② 长短轴比 < 0.70            -> 差(椭度太大, 形状可信度低)
+//   ③ 残差超限                  -> 差
+// 两条精化路径的 rms 口径不同, 不能用一个绝对阈值:
+//   - 等值线路径: rms 是"边界点相对拟合椭圆的径向残差", 用 rms/R 衡量, >2% 判差;
+//   - Zernike 路径: rms 自带选点带的固有残差(band/√3), 先除以它归一化, >1.5 倍判差。
+bool isLowQualityFit(const DetectionResult& r, const DetectorParams& p,
+                     double major, double aspect)
+{
+    if (!r.subpixel)
+        return true;
+    if (aspect < 0.70)
+        return true;
+
+    const double R = qMax(major, 1.0);
+    if (!r.contourPoints.empty())                       // 阈值等值线路径
+        return (double)r.rms > 0.02 * R;
+
+    const double band = qMax((double)p.refineBandMin, (double)p.refineBandRatio * R);
+    const double expected = band / std::sqrt(3.0);      // 带内均匀分布的理论残差地板
+    return expected > 0.0 && (double)r.rms > 1.5 * expected;
 }
 
 // 宿主侧参数不在 DetectorParams 里(那是 DLL 的按值结构, 改布局要同批重编 lib/dll),
@@ -158,6 +255,7 @@ void writeHostParams(const HostParams& h, const QString& path)
     s.setValue(QStringLiteral("enhanceEnable"), h.enhanceEnable ? 1 : 0);
     s.setValue(QStringLiteral("enhanceBlack"), h.enhanceBlack);
     s.setValue(QStringLiteral("enhanceWhite"), h.enhanceWhite);
+    s.setValue(QStringLiteral("grayscale"), h.grayscale ? 1 : 0);
     s.endGroup();
     s.sync();
 }
@@ -186,6 +284,10 @@ bool readHostParams(HostParams& h, const QString& path)
     readInt(QStringLiteral("enhanceWhite"), 1, 255, h.enhanceWhite);
     if (s.contains(QStringLiteral("enhanceEnable"))) {
         h.enhanceEnable = s.value(QStringLiteral("enhanceEnable")).toInt() != 0;
+        any = true;
+    }
+    if (s.contains(QStringLiteral("grayscale"))) {
+        h.grayscale = s.value(QStringLiteral("grayscale")).toInt() != 0;
         any = true;
     }
     s.endGroup();
@@ -416,13 +518,17 @@ void testDetect::buildUi()
     m_view->setBackgroundBrush(QBrush(QColor(0x1a, 0x20, 0x28)));
     m_view->setAlignment(Qt::AlignCenter);
     m_view->setTransformationAnchor(QGraphicsView::AnchorUnderMouse);   // 滚轮以光标为锚点
-    m_view->viewport()->installEventFilter(this);   // resize / 滚轮缩放 / 双击
+    m_view->viewport()->installEventFilter(this);   // resize / 滚轮缩放 / 双击 / 悬停取灰度
+    // 不按键也要收到 MouseMove: 灰度化时状态栏要实时显示光标像素的灰度值。
+    m_view->viewport()->setMouseTracking(true);
 
     // —— 右: 识别结果列表 ——
     m_list = new QListWidget(central);
     m_list->setMinimumWidth(300);
     m_list->setAlternatingRowColors(true);
     m_list->setUniformItemSizes(true);
+    // 质量好/差两栏之间的黄色分界线(纯绘制, 不占列表行)。
+    m_list->setItemDelegate(new QualitySeparatorDelegate(m_list));
     // 等宽字体: 坐标是变长小数, 比例字体下小数点对不齐。
     QFont mono(QStringLiteral("Consolas"));
     mono.setStyleHint(QFont::Monospace);
@@ -445,12 +551,21 @@ void testDetect::buildUi()
         "点击后在弹窗中选择模板并调整允许偏差。"));
     m_btnRemoveNoise->setEnabled(false);
 
+    // 与【删除干扰点】并排: 一键删掉全部黄色轮廓的质量差点。
+    m_btnRemovePoor = new QPushButton(QStringLiteral("删除较差的点"), central);
+    m_btnRemovePoor->setToolTip(QStringLiteral(
+        "一次删除所有质量差的结果（图上画黄色轮廓的点）：\n"
+        "包括拟合残差超限、椭度太大、以及非亚像素的项。\n"
+        "没有质量差的结果时按钮为灰色。删除后可用【撤销】恢复。"));
+    m_btnRemovePoor->setEnabled(false);
+
     QHBoxLayout* listHeader = new QHBoxLayout();
     listHeader->setContentsMargins(0, 0, 0, 0);
     listHeader->setSpacing(6);
     listHeader->addWidget(m_listTitle);
     listHeader->addStretch(1);
     listHeader->addWidget(m_btnRemoveNoise);
+    listHeader->addWidget(m_btnRemovePoor);   // 紧挨着【删除干扰点】
 
     QWidget* resultPane = new QWidget(central);
     QVBoxLayout* rl = new QVBoxLayout(resultPane);
@@ -530,6 +645,7 @@ void testDetect::buildUi()
     connect(m_list, &QListWidget::itemChanged, this, &testDetect::onItemChanged);
     connect(m_list, &QListWidget::itemClicked, this, &testDetect::onItemClicked);
     connect(m_btnRemoveNoise, &QPushButton::clicked, this, &testDetect::onRemoveNoise);
+    connect(m_btnRemovePoor, &QPushButton::clicked, this, &testDetect::onRemovePoor);
     connect(m_btnUndo, &QPushButton::clicked, this, &testDetect::onUndo);
     connect(m_btnExport, &QPushButton::clicked, this, &testDetect::onExportResults);
     m_list->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -556,7 +672,10 @@ void testDetect::buildUi()
     m_btnRoi->setEnabled(false);
     m_btnClear->setEnabled(false);
 
-    // 状态栏右侧常驻缩放比例。
+    // 状态栏右侧: 灰度读数(灰度化时才有内容) + 常驻缩放比例。
+    m_pixelLabel = new QLabel(central);
+    m_pixelLabel->setMinimumWidth(330);   // 预留宽度, 避免读数变化时状态栏左右跳
+    statusBar()->addPermanentWidget(m_pixelLabel);
     m_zoomLabel = new QLabel(central);
     statusBar()->addPermanentWidget(m_zoomLabel);
 
@@ -665,7 +784,7 @@ void testDetect::applyCameraProfile(const CameraProfile& p)
     // 坐标系已经改变: 旧结果和旧显示图都作废, 重新去畸变(含黑白场增强)并提示重新识别。
     clearResults();
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    const cv::Mat disp = enhanceImageForDetect(m_detector.undistortImage(m_srcMat));
+    const cv::Mat disp = buildDisplayImage();
     QApplication::restoreOverrideCursor();
     showImage(disp);
     m_btnRoi->setChecked(false);
@@ -965,7 +1084,7 @@ void setWidgetValue(QWidget* w, double v)
 }
 
 // ---------------------------------------------------------------- 参数权限
-// 默认用户只看到 kBasic 中的 8 项, 其余需密码解锁。
+// 默认用户只看到 kBasic 中的 9 项, 其余需密码解锁。
 // 按 key 判断而非控件指针, 三个 addXxxField 无需改动;
 // 新增参数默认归高级, 要开放给默认用户就把 key 加进 kBasic。
 bool isBasicParamKey(const QString& key)
@@ -978,7 +1097,8 @@ bool isBasicParamKey(const QString& key)
         QStringLiteral("brightThr"),          // 亮像素阈值
         QStringLiteral("minRingDirHits"),     // 方向命中数
         QStringLiteral("minApproxVertices"),  // 最少顶点数
-        QStringLiteral("minCandidateRadius")  // 候选最小半径
+        QStringLiteral("minCandidateRadius"), // 候选最小半径
+        QStringLiteral("boundaryThreshold")   // 边界阈值(灰度边界, 0 = 关闭)
     };
     return kBasic.contains(key);
 }
@@ -1100,12 +1220,16 @@ void testDetect::buildParamPane(QWidget* paramPane)
     il->setSpacing(8);
 
     QFormLayout* fPre = nullptr;
+    QFormLayout* fGray = nullptr;
     QFormLayout* fCirc = nullptr;
     QFormLayout* fSub = nullptr;
     QFormLayout* fDec = nullptr;
     QFormLayout* fEnh = nullptr;
     QFormLayout* fFilter = nullptr;
     il->addWidget(makeParamGroup(inner, QStringLiteral("预处理"), &fPre));
+    // 灰度与阈值: 唯一一个始终可见的宿主侧分组(灰度化 + 边界阈值)。
+    m_groupGray = makeParamGroup(inner, QStringLiteral("灰度与阈值"), &fGray);
+    il->addWidget(m_groupGray);
     il->addWidget(makeParamGroup(inner, QStringLiteral("轮廓筛选"), &fCirc));
     m_groupSubpixel = makeParamGroup(inner, QStringLiteral("亚像素精化"), &fSub);
     il->addWidget(m_groupSubpixel);
@@ -1147,6 +1271,33 @@ void testDetect::buildParamPane(QWidget* paramPane)
                        "调小 → 更激进(删得更多); 调大 → 更保守; 0 = 完全不删。\n"
                        "靶标与反光面粘连、被一起删掉时, 先填 0 验证是不是这个原因。"),
         0.0, 0.5, 3, &DetectorParams::bigBlobAreaRatio);
+
+    // ---- 灰度与阈值 ----
+    // 灰度化是宿主侧开关: 勾选后显示图和识别输入都换成单通道灰度图。
+    m_chkGrayscale = new QCheckBox(m_groupGray);
+    m_chkGrayscale->setToolTip(QStringLiteral(
+        "勾选后, 显示图和送进识别器的输入都先转成单通道灰度图(BGR2GRAY),\n"
+        "后续预处理、二值化、轮廓与亚像素拟合全部在这张灰度图上进行。\n"
+        "不勾选时与以前完全一致(识别器内部本来也会转灰度, 只是显示仍是彩色)。\n"
+        "灰度化打开后, 鼠标在图像上移动时状态栏右侧会实时显示该像素的灰度值,\n"
+        "并可对照「边界阈值」判断该点算边界还是背景, 方便先读数再定阈值。\n"
+        "改完记得点「应用参数」; 它不改变任何像素坐标, 识别结果叠加不变。"));
+    fGray->addRow(QStringLiteral("灰度化"), m_chkGrayscale);
+    connect(m_chkGrayscale, &QCheckBox::toggled, this, &testDetect::onParamEdited);
+
+    // 边界阈值: DLL 侧的 DetectorParams 字段(0 = 关闭, 用局部大津法)。
+    addIntField(fGray, QStringLiteral("boundaryThreshold"), QStringLiteral("边界阈值"),
+        QStringLiteral("拟合轮廓要包含的灰度边界(0~255, 0 = 关闭)。\n"
+                       "0: 保持原行为, 在候选周围用局部大津法自动找白斑边界。\n"
+                       ">0: 灰度 > 该值的像素算目标(边界), 用它重新取未腐蚀灰度图上的\n"
+                       "白斑轮廓; 拟合出的椭圆必须包住这条灰度等值线 —— 亚像素椭圆比它\n"
+                       "小时按面积比放大, 因此最终轮廓会向外扩到这条边界。\n"
+                       "用法: 先勾选「灰度化」, 把鼠标移到目标边缘上读出灰度值(状态栏),\n"
+                       "在背景灰度与目标灰度之间取一个值填进来, 再点「应用参数」并重新识别。\n"
+                       "调低 → 边界外扩(轮廓变大), 过低会把周围反光/粘连算进来;\n"
+                       "调高 → 边界内缩(轮廓变小), 过高会切掉目标边缘。\n"
+                       "它只影响轮廓拟合的边界, 不改变预处理里的「大津法/固定阈值」二值化。"),
+        0, 255, &DetectorParams::boundaryThreshold);
 
     // ---- 轮廓筛选 ----
     addDoubleField(fCirc, QStringLiteral("maxAspect"), QStringLiteral("长短轴比"),
@@ -1417,7 +1568,7 @@ void testDetect::buildParamPane(QWidget* paramPane)
     btns->addWidget(m_btnLoadParams, 1, 1);
     // 高级参数入口: 锁定时只显示此按钮, 密码正确才展开全部参数。
     m_btnUnlock = new QPushButton(QStringLiteral("高级参数…"), paramPane);
-    m_btnUnlock->setToolTip(QStringLiteral("输入密码后显示全部参数（32 项识别参数 + 图像增强/结果过滤）。\n"
+    m_btnUnlock->setToolTip(QStringLiteral("输入密码后显示全部参数（33 项识别参数 + 图像增强/结果过滤）。\n"
                                            "默认用户只需调上面那几项常用参数。"));
     btns->addWidget(m_btnUnlock, 2, 0, 1, 2);
     v->addLayout(btns);
@@ -1475,6 +1626,8 @@ HostParams testDetect::collectHostParams() const
         h.enhanceBlack = m_spinEnhanceBlack->value();
     if (m_spinEnhanceWhite)
         h.enhanceWhite = m_spinEnhanceWhite->value();
+    if (m_chkGrayscale)
+        h.grayscale = m_chkGrayscale->isChecked();
     if (m_spinMinArea)
         h.minResultArea = m_spinMinArea->value();
     if (m_spinMaxArea)
@@ -1495,6 +1648,8 @@ void testDetect::loadHostParamsToWidgets()
         m_spinEnhanceBlack->setValue(m_host.enhanceBlack);
     if (m_spinEnhanceWhite)
         m_spinEnhanceWhite->setValue(m_host.enhanceWhite);
+    if (m_chkGrayscale)
+        m_chkGrayscale->setChecked(m_host.grayscale);
     if (m_spinMinArea)
         m_spinMinArea->setValue(m_host.minResultArea);
     if (m_spinMaxArea)
@@ -1684,6 +1839,8 @@ void testDetect::onResetParams()
         // 宿主侧两组同样是高级项: 解锁时才跟着恢复默认, 锁定时保持不动。
         m_host = HostParams();
     }
+    // 「灰度化」在始终可见的分组里, 属于常用项: 锁定时也一起恢复默认。
+    m_host.grayscale = false;
     loadParamsToWidgets(def);
     loadHostParamsToWidgets();     // 控件回填(锁定时只是回到已生效值)
     m_detector.setParams(def);
@@ -1805,6 +1962,13 @@ void testDetect::onLoadParamsFile()
         readHostParams(m_host, path);
         loadHostParamsToWidgets();
     }
+    if (!m_advancedUnlocked) {
+        // 灰度化在始终可见的分组里: 锁定时也从文件读, 其余宿主侧高级项不动。
+        HostParams hp = m_host;
+        if (readHostParams(hp, path))
+            m_host.grayscale = hp.grayscale;
+        loadHostParamsToWidgets();
+    }
     loadParamsToWidgets(p);
     m_detector.setParams(p);
     loadParamsToWidgets(m_detector.params());
@@ -1878,9 +2042,9 @@ void testDetect::onImportImage()
     m_hasImage = true;
 
     // 识别坐标位于去畸变坐标系, 显示图必须同源, 否则叠加会整体偏移。
-    // 显示的是"增强后"的图, 与喂给识别器的输入观感一致, 便于调黑白场。
+    // 显示图 = 去畸变(识别输入), 灰度化时与识别器看到的完全是同一张灰度图。
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    const cv::Mat disp = enhanceImageForDetect(m_detector.undistortImage(m_srcMat));
+    const cv::Mat disp = buildDisplayImage();
     QApplication::restoreOverrideCursor();
 
     clearResults();
@@ -1916,20 +2080,48 @@ cv::Mat testDetect::enhanceImageForDetect(const cv::Mat& src) const
     return out;
 }
 
-// 只替换显示 pixmap, 不动结果图元/列表 —— 用于【应用参数】后立刻看到黑白场效果。
+// 识别输入: 先按黑白场增强, 勾选「灰度化」时再转成单通道灰度。
+// 转换权重与 DLL 内部 cvtColor(BGR2GRAY) 完全一致, 所以"宿主先转"和
+// "DLL 自己转"得到的是同一张灰度图, 检测结果不受影响。
+// 两个开关都没开时返回的是浅拷贝(与旧路径一致)。
+cv::Mat testDetect::prepareDetectInput(const cv::Mat& src) const
+{
+    cv::Mat m = enhanceImageForDetect(src);
+    if (!m_host.grayscale || m.empty() || m.channels() != 3)
+        return m;
+
+    cv::Mat g;
+    cv::cvtColor(m, g, cv::COLOR_BGR2GRAY);
+    return g;
+}
+
+// 显示图 = 去畸变(识别输入)。识别器内部对同一份输入做同样的去畸变,
+// 所以灰度化时 m_viewMat 与它真正处理的灰度图逐像素一致 —— 状态栏读数可信。
+cv::Mat testDetect::buildDisplayImage()
+{
+    if (m_srcMat.empty())
+        return cv::Mat();
+    return m_detector.undistortImage(prepareDetectInput(m_srcMat));
+}
+
+// 只替换显示 pixmap, 不动结果图元/列表 —— 用于【应用参数】后立刻看到黑白场/灰度效果。
 void testDetect::refreshDisplayImage()
 {
     if (!m_hasImage || !m_pixmapItem)
         return;
 
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    const cv::Mat disp = enhanceImageForDetect(m_detector.undistortImage(m_srcMat));
+    const cv::Mat disp = buildDisplayImage();
     QApplication::restoreOverrideCursor();
     if (disp.empty())
         return;
 
+    m_viewMat = disp;
     cv::Mat rgb;
-    cv::cvtColor(disp, rgb, cv::COLOR_BGR2RGB);
+    if (disp.channels() == 1)
+        cv::cvtColor(disp, rgb, cv::COLOR_GRAY2RGB);
+    else
+        cv::cvtColor(disp, rgb, cv::COLOR_BGR2RGB);
     const QImage img(rgb.data, rgb.cols, rgb.rows, (int)rgb.step, QImage::Format_RGB888);
     m_pixmapItem->setPixmap(QPixmap::fromImage(img.copy()));
 }
@@ -1941,8 +2133,15 @@ void testDetect::showImage(const cv::Mat& bgr)
     m_pixmapItem = nullptr;
     m_roiItem = nullptr;
 
+    // 保存当前显示图: 灰度化时鼠标悬停从这里读灰度值(1 通道), 坐标与 scene 一致。
+    m_viewMat = bgr;
+    clearPixelInfo();
+
     cv::Mat rgb;
-    cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+    if (bgr.channels() == 1)
+        cv::cvtColor(bgr, rgb, cv::COLOR_GRAY2RGB);
+    else
+        cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
     // QImage 不接管数据, 转 QPixmap 前必须深拷贝。
     const QImage img(rgb.data, rgb.cols, rgb.rows, (int)rgb.step, QImage::Format_RGB888);
     m_pixmapItem = m_scene->addPixmap(QPixmap::fromImage(img.copy()));
@@ -1983,9 +2182,9 @@ void testDetect::onStartDetect()
     setBusy(true);
     statusBar()->showMessage(QStringLiteral("识别编码片中…"));
 
-    // 识别输入按已生效的黑白场增强; 未启用时是浅拷贝, 新图时是增强后的新 Mat。
+    // 识别输入 = 已生效的黑白场增强 + 可选的灰度化; 都未启用时是浅拷贝。
     // 在主线程算好再交给工作线程, 参数取的是点击这一刻的快照。
-    cv::Mat input = enhanceImageForDetect(m_srcMat);
+    cv::Mat input = prepareDetectInput(m_srcMat);
     m_thread = QThread::create([this, input]() mutable {
         std::vector<DetectionResult> results;
         try {
@@ -2019,9 +2218,9 @@ void testDetect::onStartDetectMarkers()
     setBusy(true);
     statusBar()->showMessage(QStringLiteral("标记点识别中…"));
 
-    // 识别输入按已生效的黑白场增强; 未启用时是浅拷贝, 新图时是增强后的新 Mat。
+    // 识别输入 = 已生效的黑白场增强 + 可选的灰度化; 都未启用时是浅拷贝。
     // 在主线程算好再交给工作线程, 参数取的是点击这一刻的快照。
-    cv::Mat input = enhanceImageForDetect(m_srcMat);
+    cv::Mat input = prepareDetectInput(m_srcMat);
     m_thread = QThread::create([this, input]() mutable {
         std::vector<DetectionResult> results;
         try {
@@ -2052,9 +2251,9 @@ void testDetect::onStartDetectAll()
     setBusy(true);
     statusBar()->showMessage(QStringLiteral("识别所有标记点（含编码片）中…"));
 
-    // 识别输入按已生效的黑白场增强; 未启用时是浅拷贝, 新图时是增强后的新 Mat。
+    // 识别输入 = 已生效的黑白场增强 + 可选的灰度化; 都未启用时是浅拷贝。
     // 在主线程算好再交给工作线程, 参数取的是点击这一刻的快照。
-    cv::Mat input = enhanceImageForDetect(m_srcMat);
+    cv::Mat input = prepareDetectInput(m_srcMat);
     m_thread = QThread::create([this, input]() mutable {
         std::vector<DetectionResult> coded, markers;
         try {
@@ -2193,7 +2392,8 @@ testDetect::Marker testDetect::createMarker(const DetectionResult& r, bool isMar
     mk.subpixel = r.subpixel;
     mk.rms = r.rms;
     mk.nPoints = r.nPoints;
-    // 几何描述取实际绘制的轮廓: 有拟合椭圆用椭圆, 否则用圆。
+    // 长短轴/长短轴比仍取拟合椭圆(椭圆由等值线点拟合而来, 两者同源);
+    // 面积由 resultArea 按实际绘制的轮廓算(等值线优先)。
     if (r.hasEllipse && r.ellipse.size.width > 0 && r.ellipse.size.height > 0) {
         const double w = r.ellipse.size.width;
         const double h = r.ellipse.size.height;
@@ -2205,19 +2405,29 @@ testDetect::Marker testDetect::createMarker(const DetectionResult& r, bool isMar
         mk.aspect = 1.0;
     }
     mk.area = resultArea(r);
+    // 质量分级: 残差/椭度/是否亚像素三项合并判定, 差的画黄色并沉到列表底部。
+    mk.lowQuality = isLowQualityFit(r, m_detector.params(), mk.major, mk.aspect);
 
-    // 优先画亚像素椭圆, 退化时按圆。
+    // 轮廓: 有阈值等值线就画那一圈平滑曲线(严格经过亚像素边界点);
+    // 否则退回拟合椭圆, 再退化按圆。
     mk.contour = new QGraphicsPathItem();
-    if (r.hasEllipse)
+    if (r.contourPoints.size() >= 8)
+        mk.contour->setPath(smoothClosedPath(r.contourPoints));
+    else if (r.hasEllipse)
         mk.contour->setPath(contourPath(r.ellipse));
     else
         mk.contour->setPath(contourPath(r.center, qMax((double)r.radius, 1.0)));
     m_scene->addItem(mk.contour);
     mk.contour->setZValue(2);
 
-    // 中心小点, 不遮挡轮廓。
-    mk.dot = m_scene->addEllipse(mk.pos.x() - m_markRadius * 0.3,
-        mk.pos.y() - m_markRadius * 0.3, m_markRadius * 0.6, m_markRadius * 0.6);
+    // 中心点: 固定屏幕尺寸的小圆点, 不遮挡轮廓, 也不随视图缩放变粗。
+    // ItemIgnoresTransformations 让 rect 直接按设备像素解释, 所以放大多少倍
+    // 都只是中心处一个几像素的小点 —— 位置仍是亚像素中心。
+    const double dotR = 2.0;
+    mk.dot = new QGraphicsEllipseItem(-dotR, -dotR, dotR * 2.0, dotR * 2.0);
+    mk.dot->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+    mk.dot->setPos(mk.pos);
+    m_scene->addItem(mk.dot);
     mk.dot->setZValue(3);
 
     mk.label = new QGraphicsTextItem();
@@ -2234,6 +2444,12 @@ testDetect::Marker testDetect::createMarker(const DetectionResult& r, bool isMar
 // 合并完成后的统一收尾: 重排标记点编号 -> 重建列表行 -> 刷新统计。
 void testDetect::finalizeResultMerge()
 {
+    // 质量好的点排前面, 质量差的沉到列表底部。stable_sort 保留同组内的原顺序
+    // (编码片在前、标记点在后), 所以列表仍是"好的编码片 → 好的标记点 →
+    //  差的编码片 → 差的标记点"; 行号 == m_markers 下标的不变量不受影响。
+    std::stable_sort(m_markers.begin(), m_markers.end(),
+        [](const Marker& a, const Marker& b) { return !a.lowQuality && b.lowQuality; });
+
     // 标记点按最终列表顺序从 1 连续编号; 编码片保留自己的 ID。
     int seq = 0;
     for (Marker& mk : m_markers) {
@@ -2251,6 +2467,12 @@ void testDetect::finalizeResultMerge()
         m_roiItem->setVisible(false);
     }
 
+    // 分界线画在第一条质量差的结果上方(排序后差的结果都在末尾)。
+    int firstPoor = -1;
+    for (int i = 0; i < m_markers.size(); ++i) {
+        if (m_markers[i].lowQuality) { firstPoor = i; break; }
+    }
+
     m_updatingList = true;
     m_list->clear();
     m_pressedItem = nullptr;          // 列表项已销毁, 不能再留按下记录
@@ -2262,8 +2484,9 @@ void testDetect::finalizeResultMerge()
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
         item->setCheckState(Qt::Unchecked);
         item->setData(Qt::UserRole, i);     // 行号 == m_markers 下标
-        if (!mk.subpixel)
-            item->setForeground(QBrush(QColor(255, 170, 60)));   // 非亚像素: 橙色提醒
+        item->setData(kFirstPoorRole, i == firstPoor);
+        if (mk.lowQuality)
+            item->setForeground(QBrush(QColor(255, 210, 40)));   // 质量差: 黄色(与轮廓同色)
     }
     m_updatingList = false;
 
@@ -2289,6 +2512,9 @@ QString testDetect::markerRowText(const Marker& mk)
         .arg(mk.pos.y(), 0, 'f', 3);
     // 面积紧跟坐标: 列表宽度有限, 放在质量信息后面容易被省略号截掉。
     text += QStringLiteral("面积 %1平方像素   ").arg(mk.area, 0, 'f', 1);
+    // "质量差"放在 rms 前面: 列表右侧常被省略, 放末尾会看不到。
+    if (mk.lowQuality && mk.subpixel)
+        text += QStringLiteral("质量差   ");
     if (mk.subpixel)
         text += QStringLiteral("±%1px / %2pt").arg(mk.rms, 0, 'f', 3).arg(mk.nPoints);
     else
@@ -2302,10 +2528,11 @@ QString testDetect::resultSummary() const
     if (m_markers.isEmpty())
         return QStringLiteral("未识别到任何结果");
 
-    int nCoded = 0, nMark = 0, nSub = 0;
+    int nCoded = 0, nMark = 0, nSub = 0, nPoor = 0;
     double rmsSum = 0.0, rmsMax = 0.0;
     for (const Marker& mk : m_markers) {
         if (mk.isMarker) ++nMark; else ++nCoded;
+        if (mk.lowQuality) ++nPoor;
         if (!mk.subpixel) continue;
         ++nSub;
         rmsSum += mk.rms;
@@ -2325,7 +2552,9 @@ QString testDetect::resultSummary() const
         s += QStringLiteral("  残差 RMS 均值 %1px / 最大 %2px")
             .arg(rmsSum / nSub, 0, 'f', 3).arg(rmsMax, 0, 'f', 3);
     if (nSub < m_markers.size())
-        s += QStringLiteral("  (!) %1 个退回整数轮廓, 见橙虚线").arg(m_markers.size() - nSub);
+        s += QStringLiteral("  (!) %1 个退回整数轮廓, 见黄虚线").arg(m_markers.size() - nSub);
+    if (nPoor > 0)
+        s += QStringLiteral("  质量差 %1 个(黄色, 已排在最后)").arg(nPoor);
     return s;
 }
 
@@ -2467,6 +2696,7 @@ int testDetect::removeMarkerRows(QVector<int> rows)
     m_pressedItem = nullptr;
     if (m_markers.isEmpty() && m_roiMode)
         m_btnRoi->setChecked(false);
+    updateQualitySeparator();
     updateResultTitle();
     updateResultButtons();
     applyHighlights();
@@ -2486,6 +2716,23 @@ void testDetect::clearUndoStack()
     m_undoStack.clear();
 }
 
+// 删除/撤销后 m_markers 变了, 重新标出"第一条较差结果"的那一行。
+// 行号与 marker 下标仍一一对应, 这里只更新 Qt::UserRole+2 这个绘制标记。
+void testDetect::updateQualitySeparator()
+{
+    int firstPoor = -1;
+    for (int i = 0; i < m_markers.size(); ++i) {
+        if (m_markers[i].lowQuality) { firstPoor = i; break; }
+    }
+    m_updatingList = true;
+    for (int row = 0; row < m_list->count(); ++row) {
+        QListWidgetItem* item = m_list->item(row);
+        const int idx = item->data(Qt::UserRole).toInt();
+        item->setData(kFirstPoorRole, idx == firstPoor);
+    }
+    m_updatingList = false;
+}
+
 void testDetect::updateResultButtons()
 {
     const bool has = !m_markers.isEmpty() && !m_busy;
@@ -2495,6 +2742,13 @@ void testDetect::updateResultButtons()
         m_btnUndo->setEnabled(!m_undoStack.isEmpty() && !m_busy);
     if (m_btnExport)
         m_btnExport->setEnabled(has);
+    if (m_btnRemovePoor) {
+        bool hasPoor = false;
+        for (const Marker& mk : m_markers) {
+            if (mk.lowQuality) { hasPoor = true; break; }
+        }
+        m_btnRemovePoor->setEnabled(hasPoor && !m_busy);
+    }
     if (m_btnRoi)
         m_btnRoi->setEnabled(has);
     if (m_btnClear)
@@ -2530,6 +2784,7 @@ void testDetect::onUndo()
     m_updatingList = false;
 
     m_pressedItem = nullptr;
+    updateQualitySeparator();
     updateResultTitle();
     updateResultButtons();
     applyHighlights();
@@ -2728,6 +2983,27 @@ void testDetect::onRemoveNoise()
     statusBar()->showMessage(QStringLiteral("已按模板删除 %1 个干扰点").arg(n));
 }
 
+// 一键删除所有质量差的点(黄色轮廓): 残差超限 / 椭度太大 / 非亚像素。
+// 走 removeMarkerRows() 同一条路: 记入删除黑名单、进撤销栈、重排列表行号。
+void testDetect::onRemovePoor()
+{
+    if (m_busy || m_markers.isEmpty())
+        return;
+
+    QVector<int> rows;
+    for (int i = 0; i < m_markers.size(); ++i) {
+        if (m_markers[i].lowQuality)
+            rows.push_back(i);
+    }
+    if (rows.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("没有质量差的点"));
+        return;
+    }
+
+    const int n = removeMarkerRows(rows);
+    statusBar()->showMessage(QStringLiteral("已删除 %1 个质量差的点（可撤销）").arg(n));
+}
+
 
 // ---------------------------------------------------------------- 画框 / 高亮
 
@@ -2803,18 +3079,26 @@ void testDetect::applyHighlights()
         };
         QPen contourPen;
         if (on)
-            contourPen = screenPen(QColor(255, 60, 60), 2.0);
+            contourPen = screenPen(QColor(255, 60, 60), 2.0);          // 勾选: 红色置顶
+        else if (mk.lowQuality)
+            contourPen = screenPen(QColor(255, 210, 40), 1.5,
+                                   mk.subpixel ? Qt::SolidLine : Qt::DashLine);  // 质量差: 黄色
         else if (mk.subpixel)
-            contourPen = screenPen(QColor(0, 255, 170), 1.0);
+            contourPen = screenPen(QColor(0, 255, 170), 1.0);          // 好: 青绿
         else
             contourPen = screenPen(QColor(255, 170, 60), 1.0, Qt::DashLine);
         mk.contour->setPen(contourPen);
 
-        const double r = m_markRadius * (on ? 0.5 : 0.3);
-        mk.dot->setRect(mk.pos.x() - r, mk.pos.y() - r, r * 2, r * 2);
+        // 中心点固定为屏幕像素尺寸(ItemIgnoresTransformations), 放大后仍是准确的小点:
+        // 半径 2px, 勾选时 2.5px。外圈一道深色描边保证白底上也看得见。
+        const double dotR = on ? 2.5 : 2.0;
+        mk.dot->setRect(-dotR, -dotR, dotR * 2.0, dotR * 2.0);
         mk.dot->setBrush(on ? QBrush(QColor(255, 60, 60, 235))
-                            : QBrush(QColor(255, 220, 60, 200)));
-        mk.dot->setPen(Qt::NoPen);
+                            : QBrush(QColor(255, 220, 60, 220)));
+        QPen dotPen(QColor(0, 0, 0, 170));
+        dotPen.setWidthF(1.0);
+        dotPen.setCosmetic(true);
+        mk.dot->setPen(dotPen);
 
         mk.label->setHtml(idLabelHtml(mk.id, on, m_labelFontPx, mk.isMarker));
 
@@ -2912,6 +3196,52 @@ void testDetect::updateZoomLabel()
         .arg(m_view->transform().m11() * 100.0, 0, 'f', 1));
 }
 
+// 灰度化模式下状态栏的像素读数: 坐标 + 灰度值 + 与边界阈值的关系。
+// 读的是 m_viewMat(显示图, 与识别输入同源), scene 坐标原点即图像左上角,
+// 所以视图缩放/平移后 mapToScene 仍能给出正确的像素下标。
+void testDetect::updatePixelInfo(const QPoint& viewportPos)
+{
+    if (!m_pixelLabel)
+        return;
+    if (!m_hasImage || !m_host.grayscale || m_viewMat.empty()) {
+        m_pixelLabel->clear();
+        return;
+    }
+
+    const QPointF sp = m_view->mapToScene(viewportPos);
+    const int x = (int)std::floor(sp.x());
+    const int y = (int)std::floor(sp.y());
+    if (x < 0 || y < 0 || x >= m_viewMat.cols || y >= m_viewMat.rows) {
+        m_pixelLabel->clear();
+        return;
+    }
+
+    int gray = 0;
+    if (m_viewMat.channels() == 1) {
+        gray = m_viewMat.at<uchar>(y, x);
+    }
+    else {
+        // 兜底: 与 cv::cvtColor(BGR2GRAY) 用同一组权重。
+        const cv::Vec3b& p = m_viewMat.at<cv::Vec3b>(y, x);
+        gray = cvRound(0.114 * p[0] + 0.587 * p[1] + 0.299 * p[2]);
+    }
+
+    QString text = QStringLiteral("像素 (%1, %2)  灰度 %3").arg(x).arg(y).arg(gray);
+    const int thr = m_detector.params().boundaryThreshold;
+    if (thr > 0) {
+        text += (gray > thr)
+            ? QStringLiteral("   > 边界阈值 %1（边界）").arg(thr)
+            : QStringLiteral("   <= 边界阈值 %1（背景）").arg(thr);
+    }
+    m_pixelLabel->setText(text);
+}
+
+void testDetect::clearPixelInfo()
+{
+    if (m_pixelLabel)
+        m_pixelLabel->clear();
+}
+
 bool testDetect::eventFilter(QObject* watched, QEvent* event)
 {
     // 记录按下瞬间的勾选态, 供 onItemClicked 判断 Qt 是否已切换。
@@ -2950,6 +3280,15 @@ bool testDetect::eventFilter(QObject* watched, QEvent* event)
         case QEvent::MouseButtonDblClick:
             if (static_cast<QMouseEvent*>(event)->button() == Qt::LeftButton)
                 onFitView();    // 双击恢复适应窗口
+            break;
+
+        case QEvent::MouseMove:
+            // 灰度化时实时显示光标所在像素的灰度值(坐标换算在 updatePixelInfo 里)。
+            updatePixelInfo(static_cast<QMouseEvent*>(event)->pos());
+            break;
+
+        case QEvent::Leave:
+            clearPixelInfo();
             break;
 
         default:

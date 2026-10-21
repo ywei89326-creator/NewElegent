@@ -73,6 +73,11 @@ struct HostParams {
     bool enhanceEnable = false;
     int  enhanceBlack = 0;
     int  enhanceWhite = 255;
+
+    // 灰度化: 勾选后显示图、识别输入都用单通道灰度图(CV_8UC1)。
+    // 转换在宿主侧完成(BGR2GRAY, 与 DLL 内部的 cvtColor 同一组权重), DLL 直接
+    // 拿灰度图跑预处理/拟合; 不勾选时行为与以前完全一致。纯点运算, 不改坐标。
+    bool grayscale = false;
 };
 
 // 主窗口: 导入图片 → 识别 → 结果列表与叠加显示; 勾选结果可连成 ROI。
@@ -100,6 +105,7 @@ private slots:
     void onItemClicked(QListWidgetItem* item);
     void onListContextMenu(const QPoint& pos);   // 右键删除单个结果
     void onRemoveNoise();                        // 按轮廓面积批量删除干扰点
+    void onRemovePoor();                         // 一键删除所有质量差(黄色轮廓)的点
     void onUndo();                               // 撤销上一次删除
     void onExportResults();                      // 导出剩余结果到 txt
     void onClearSelection();
@@ -123,6 +129,8 @@ private:
         double major = 0.0;                     // 长半轴(px)
         double aspect = 1.0;                    // 短轴/长轴, 圆为 1
         bool subpixel = true;                   // false = 中心退回了整数轮廓, 不是亚像素的
+        bool lowQuality = false;                // 拟合质量差(残差大 / 椭度大 / 非亚像素):
+                                                // 轮廓画黄色, 结果列表排在最后
         float rms = 0.f;                        // 拟合残差(仅供参考, 非标定精度)
         int nPoints = 0;                        // 参与拟合的点数
         QGraphicsPathItem* contour = nullptr;   // 亚像素拟合轮廓(倾斜时是椭圆)
@@ -154,6 +162,14 @@ private:
     void refreshDisplayImage();                          // 只换显示图, 保留结果叠加
     // 按 m_host 的黑白场把图像拉伸成高对比版本; 未启用时原样返回(浅拷贝)。
     cv::Mat enhanceImageForDetect(const cv::Mat& src) const;
+    // 识别输入: 先按黑白场增强, 勾选「灰度化」时再转成单通道灰度。
+    cv::Mat prepareDetectInput(const cv::Mat& src) const;
+    // 显示图 = 去畸变(prepareDetectInput(原图))。与识别器内部看到的图同源,
+    // 所以灰度化时鼠标悬停读到的就是识别器实际使用的灰度值。
+    cv::Mat buildDisplayImage();
+    // 灰度化模式下, 在状态栏右侧显示鼠标所在像素的坐标/灰度/与边界阈值的关系。
+    void updatePixelInfo(const QPoint& viewportPos);
+    void clearPixelInfo();
     void clearResults();
     void applyHighlights();
     void updateRoiStatus();
@@ -164,6 +180,7 @@ private:
     int removeMarkerRows(QVector<int> rows);
     void clearUndoStack();                                // 丢弃撤销记录并销毁被摘除的图元
     void updateResultButtons();                           // 撤销/导出/删除等结果相关按钮的可用状态
+    void updateQualitySeparator();                        // 重算"质量好/差"分界线画在哪一行
 
     // ---- 编码片/标记点混合结果 ----
     // 三个识别入口最终都汇到这里: 只替换被重算的那一类, 另一类按编码片区域/删除黑名单合并。
@@ -233,6 +250,9 @@ private:
     TargetDetector m_detector{ nullptr };
     CameraProfile m_activeCamera;    // 当前生效的标定(名称 + K + D)
     cv::Mat m_srcMat;                // 导入的原始图(未去畸变), 识别时喂给它
+    // 当前显示图(已去畸变 + 增强, 灰度化时是 CV_8UC1)。鼠标悬停读灰度值用它,
+    // 坐标与 m_pixmapItem 的 scene 坐标一致(原点 = 图像左上角)。
+    cv::Mat m_viewMat;
     bool m_hasImage = false;
     bool m_roiMode = false;          // 「开始画框」是否打开
     bool m_busy = false;
@@ -246,10 +266,12 @@ private:
     QListWidget* m_list = nullptr;
     QLabel* m_listTitle = nullptr;
     QPushButton* m_btnRemoveNoise = nullptr;   // 【删除干扰点】模板匹配批量删除
+    QPushButton* m_btnRemovePoor = nullptr;    // 【删除较差的点】删除全部黄色轮廓结果
     QPushButton* m_btnUndo = nullptr;          // 【撤销】恢复上一次删除
     QPushButton* m_btnExport = nullptr;        // 【导出】当前剩余结果 -> txt
     QVector<UndoOp> m_undoStack;               // 删除操作的撤销记录(仅本次识别有效)
     QLabel* m_zoomLabel = nullptr;   // 状态栏右侧常驻的缩放比例
+    QLabel* m_pixelLabel = nullptr;  // 状态栏右侧: 灰度化时鼠标所在像素的灰度/边界判定
 
     // ---- 参数设置栏 ----
     QVector<ParamField> m_fields;
@@ -279,6 +301,10 @@ private:
     QCheckBox* m_chkEnhance = nullptr;
     QSpinBox* m_spinEnhanceBlack = nullptr;
     QSpinBox* m_spinEnhanceWhite = nullptr;
+    // 灰度与阈值: 灰度化开关(宿主侧) + 边界阈值(DetectorParams, DLL 侧)。
+    // 完整识别链路不使用密码, 整组始终可见。
+    QGroupBox* m_groupGray = nullptr;
+    QCheckBox* m_chkGrayscale = nullptr;
     // 结果过滤: 面积窗口, 进列表前丢弃。
     QGroupBox* m_groupResultFilter = nullptr;
     QSpinBox* m_spinMinArea = nullptr;
