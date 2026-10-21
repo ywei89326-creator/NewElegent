@@ -78,6 +78,14 @@ struct HostParams {
     // 转换在宿主侧完成(BGR2GRAY, 与 DLL 内部的 cvtColor 同一组权重), DLL 直接
     // 拿灰度图跑预处理/拟合; 不勾选时行为与以前完全一致。纯点运算, 不改坐标。
     bool grayscale = false;
+
+    // ---- 质量分级(只影响黄色标记与列表排序, 不丢弃结果) ----
+    // 长短轴比(短/长)低于它 -> 质量差。
+    double poorAspect = 0.70;
+    // 等值线路径: rms / 半径 超过它(百分比) -> 质量差。
+    double poorIsoRmsPercent = 2.0;
+    // Zernike 路径: rms 超过 (选点带宽/√3) 的倍数 -> 质量差。
+    double poorZernikeRmsFactor = 1.5;
 };
 
 // 主窗口: 导入图片 → 识别 → 结果列表与叠加显示; 勾选结果可连成 ROI。
@@ -131,6 +139,7 @@ private:
         bool subpixel = true;                   // false = 中心退回了整数轮廓, 不是亚像素的
         bool lowQuality = false;                // 拟合质量差(残差大 / 椭度大 / 非亚像素):
                                                 // 轮廓画黄色, 结果列表排在最后
+        bool isocontour = false;                // 轮廓来自阈值等值线(质量分级用它的残差口径)
         float rms = 0.f;                        // 拟合残差(仅供参考, 非标定精度)
         int nPoints = 0;                        // 参与拟合的点数
         QGraphicsPathItem* contour = nullptr;   // 亚像素拟合轮廓(倾斜时是椭圆)
@@ -181,6 +190,7 @@ private:
     void clearUndoStack();                                // 丢弃撤销记录并销毁被摘除的图元
     void updateResultButtons();                           // 撤销/导出/删除等结果相关按钮的可用状态
     void updateQualitySeparator();                        // 重算"质量好/差"分界线画在哪一行
+    void reclassifyResults();                             // 按当前质量阈值重算好坏并重排列表(不重新识别)
 
     // ---- 编码片/标记点混合结果 ----
     // 三个识别入口最终都汇到这里: 只替换被重算的那一类, 另一类按编码片区域/删除黑名单合并。
@@ -305,6 +315,11 @@ private:
     // 完整识别链路不使用密码, 整组始终可见。
     QGroupBox* m_groupGray = nullptr;
     QCheckBox* m_chkGrayscale = nullptr;
+    // 质量分级: 三项宿主侧阈值, 决定哪些点画黄色/沉底。始终可见。
+    QGroupBox* m_groupQuality = nullptr;
+    QDoubleSpinBox* m_spinPoorAspect = nullptr;
+    QDoubleSpinBox* m_spinPoorIsoRms = nullptr;
+    QDoubleSpinBox* m_spinPoorZernike = nullptr;
     // 结果过滤: 面积窗口, 进列表前丢弃。
     QGroupBox* m_groupResultFilter = nullptr;
     QSpinBox* m_spinMinArea = nullptr;

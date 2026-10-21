@@ -221,27 +221,30 @@ double resultArea(const DetectionResult& r)
 }
 
 // 质量分级: 只影响显示(黄色轮廓 + 列表沉底), 不丢弃结果。
-//   ① 非亚像素                  -> 差
-//   ② 长短轴比 < 0.70            -> 差(椭度太大, 形状可信度低)
-//   ③ 残差超限                  -> 差
+//   ① 非亚像素                            -> 差
+//   ② 长短轴比 < 参数栏「长短轴比下限」    -> 差(椭度太大, 形状可信度低)
+//   ③ 残差超限                            -> 差
 // 两条精化路径的 rms 口径不同, 不能用一个绝对阈值:
-//   - 等值线路径: rms 是"边界点相对拟合椭圆的径向残差", 用 rms/R 衡量, >2% 判差;
-//   - Zernike 路径: rms 自带选点带的固有残差(band/√3), 先除以它归一化, >1.5 倍判差。
-bool isLowQualityFit(const DetectionResult& r, const DetectorParams& p,
-                     double major, double aspect)
+//   - 等值线路径: rms 是"边界点相对拟合椭圆的径向残差", 用 rms/R 衡量,
+//     超过「等值线残差上限(%)」判差;
+//   - Zernike 路径: rms 自带选点带的固有残差(band/√3), 先除以它归一化,
+//     超过「Zernike 残差倍数」判差。
+// 三个阈值都在 HostParams 里(参数栏「质量分级」组, 随应用参数生效)。
+bool isLowQualityFit(bool subpixel, bool isocontour, float rms, double major,
+                     double aspect, const HostParams& h, const DetectorParams& p)
 {
-    if (!r.subpixel)
+    if (!subpixel)
         return true;
-    if (aspect < 0.70)
+    if (aspect < h.poorAspect)
         return true;
 
     const double R = qMax(major, 1.0);
-    if (!r.contourPoints.empty())                       // 阈值等值线路径
-        return (double)r.rms > 0.02 * R;
+    if (isocontour)                                     // 阈值等值线路径
+        return (double)rms > (h.poorIsoRmsPercent / 100.0) * R;
 
     const double band = qMax((double)p.refineBandMin, (double)p.refineBandRatio * R);
     const double expected = band / std::sqrt(3.0);      // 带内均匀分布的理论残差地板
-    return expected > 0.0 && (double)r.rms > 1.5 * expected;
+    return expected > 0.0 && (double)rms > h.poorZernikeRmsFactor * expected;
 }
 
 // 宿主侧参数不在 DetectorParams 里(那是 DLL 的按值结构, 改布局要同批重编 lib/dll),
@@ -256,6 +259,9 @@ void writeHostParams(const HostParams& h, const QString& path)
     s.setValue(QStringLiteral("enhanceBlack"), h.enhanceBlack);
     s.setValue(QStringLiteral("enhanceWhite"), h.enhanceWhite);
     s.setValue(QStringLiteral("grayscale"), h.grayscale ? 1 : 0);
+    s.setValue(QStringLiteral("poorAspect"), h.poorAspect);
+    s.setValue(QStringLiteral("poorIsoRmsPercent"), h.poorIsoRmsPercent);
+    s.setValue(QStringLiteral("poorZernikeRmsFactor"), h.poorZernikeRmsFactor);
     s.endGroup();
     s.sync();
 }
@@ -290,6 +296,19 @@ bool readHostParams(HostParams& h, const QString& path)
         h.grayscale = s.value(QStringLiteral("grayscale")).toInt() != 0;
         any = true;
     }
+    auto readDouble = [&](const QString& key, double lo, double hi, double& out) {
+        if (!s.contains(key))
+            return;
+        bool ok = false;
+        const double v = s.value(key).toDouble(&ok);
+        if (ok) {
+            out = qBound(lo, v, hi);
+            any = true;
+        }
+    };
+    readDouble(QStringLiteral("poorAspect"), 0.10, 1.00, h.poorAspect);
+    readDouble(QStringLiteral("poorIsoRmsPercent"), 0.1, 50.0, h.poorIsoRmsPercent);
+    readDouble(QStringLiteral("poorZernikeRmsFactor"), 0.5, 10.0, h.poorZernikeRmsFactor);
     s.endGroup();
     return any;
 }
@@ -1226,10 +1245,14 @@ void testDetect::buildParamPane(QWidget* paramPane)
     QFormLayout* fDec = nullptr;
     QFormLayout* fEnh = nullptr;
     QFormLayout* fFilter = nullptr;
+    QFormLayout* fQuality = nullptr;
     il->addWidget(makeParamGroup(inner, QStringLiteral("预处理"), &fPre));
     // 灰度与阈值: 唯一一个始终可见的宿主侧分组(灰度化 + 边界阈值)。
     m_groupGray = makeParamGroup(inner, QStringLiteral("灰度与阈值"), &fGray);
     il->addWidget(m_groupGray);
+    // 质量分级: 宿主侧阈值, 始终可见, 放在前部方便随调随看。
+    m_groupQuality = makeParamGroup(inner, QStringLiteral("质量分级"), &fQuality);
+    il->addWidget(m_groupQuality);
     il->addWidget(makeParamGroup(inner, QStringLiteral("轮廓筛选"), &fCirc));
     m_groupSubpixel = makeParamGroup(inner, QStringLiteral("亚像素精化"), &fSub);
     il->addWidget(m_groupSubpixel);
@@ -1547,7 +1570,50 @@ void testDetect::buildParamPane(QWidget* paramPane)
     connect(m_spinMaxArea, QOverload<int>::of(&QSpinBox::valueChanged),
         this, &testDetect::onParamEdited);
 
-    loadHostParamsToWidgets();     // 初始化两组宿主侧控件的值
+    // ---- 质量分级(宿主侧) ----
+    // 三项决定哪些点画黄色、沉到列表底部。只影响显示, 不丢弃结果。
+    auto addQualitySpin = [&](const QString& label, const QString& tip,
+                              double lo, double hi, int decimals) -> QDoubleSpinBox* {
+        QDoubleSpinBox* sb = new QDoubleSpinBox(m_groupQuality);
+        sb->setRange(lo, hi);
+        sb->setDecimals(decimals);
+        sb->setSingleStep(std::pow(10.0, -decimals));
+        sb->setAccelerated(true);
+        sb->setKeyboardTracking(false);
+        sb->setFixedWidth(96);
+        sb->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        sb->setToolTip(tip);
+        fQuality->addRow(label, sb);
+        connect(sb, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, &testDetect::onParamEdited);
+        return sb;
+    };
+
+    m_spinPoorAspect = addQualitySpin(QStringLiteral("长短轴比下限"),
+        QStringLiteral("短轴/长轴 小于该值的椭圆判为质量差(黄色轮廓、列表沉底)。\n"
+                       "默认 0.70: 明显被拉扁/拟合不圆的点才会变黄。\n"
+                       "调高(0.8~0.9) → 更多倾斜椭圆被判差;\n"
+                       "调低(0.4~0.6) → 更宽松, 只抓极端扁的形状。\n"
+                       "只影响显示与排序, 不会删除任何结果。"),
+        0.10, 1.00, 2);
+
+    m_spinPoorIsoRms = addQualitySpin(QStringLiteral("等值线残差上限(%)"),
+        QStringLiteral("阈值等值线结果(黄色边界轮廓)的质量门槛:\n"
+                       "残差 rms / 目标半径 超过该百分比就判为质量差。\n"
+                       "默认 2.0%。干净边界实测约 0.3%~1%;\n"
+                       "调高 → 更宽松, 调低 → 更容易把边界毛糙的点标黄。\n"
+                       "只影响显示与排序, 不删除结果。"),
+        0.1, 50.0, 1);
+
+    m_spinPoorZernike = addQualitySpin(QStringLiteral("Zernike 残差倍数"),
+        QStringLiteral("Zernike 精化结果的质量门槛:\n"
+                       "rms 超过 (选点带宽/1.732) 的该倍数就判为质量差。\n"
+                       "选点带内的均匀分布天然产生约 1.0 倍残差, 所以默认 1.5 倍,\n"
+                       "即比理论地板高 50% 才算差。调大 → 更宽松; 调小 → 更严格。\n"
+                       "只影响显示与排序, 不删除结果。"),
+        0.5, 10.0, 1);
+
+    loadHostParamsToWidgets();     // 初始化宿主侧控件(含灰度/质量分级)的值
 
     il->addStretch(1);
     m_paramScroll->setWidget(inner);
@@ -1628,6 +1694,12 @@ HostParams testDetect::collectHostParams() const
         h.enhanceWhite = m_spinEnhanceWhite->value();
     if (m_chkGrayscale)
         h.grayscale = m_chkGrayscale->isChecked();
+    if (m_spinPoorAspect)
+        h.poorAspect = qBound(0.10, m_spinPoorAspect->value(), 1.00);
+    if (m_spinPoorIsoRms)
+        h.poorIsoRmsPercent = qBound(0.1, m_spinPoorIsoRms->value(), 50.0);
+    if (m_spinPoorZernike)
+        h.poorZernikeRmsFactor = qBound(0.5, m_spinPoorZernike->value(), 10.0);
     if (m_spinMinArea)
         h.minResultArea = m_spinMinArea->value();
     if (m_spinMaxArea)
@@ -1650,6 +1722,12 @@ void testDetect::loadHostParamsToWidgets()
         m_spinEnhanceWhite->setValue(m_host.enhanceWhite);
     if (m_chkGrayscale)
         m_chkGrayscale->setChecked(m_host.grayscale);
+    if (m_spinPoorAspect)
+        m_spinPoorAspect->setValue(m_host.poorAspect);
+    if (m_spinPoorIsoRms)
+        m_spinPoorIsoRms->setValue(m_host.poorIsoRmsPercent);
+    if (m_spinPoorZernike)
+        m_spinPoorZernike->setValue(m_host.poorZernikeRmsFactor);
     if (m_spinMinArea)
         m_spinMinArea->setValue(m_host.minResultArea);
     if (m_spinMaxArea)
@@ -1810,18 +1888,30 @@ void testDetect::onApplyParams()
     m_detector.setParams(wanted);            // DLL 侧还会再夹取一次范围
     // 回读实际生效值, 保证界面与算法一致(例如腐蚀核填偶数会被夹成奇数)。
     loadParamsToWidgets(m_detector.params());
-    // 宿主侧参数(图像增强/面积窗口): 与 DLL 参数一起在【应用参数】时生效。
+    // 宿主侧参数(图像增强/面积窗口/质量分级): 与 DLL 参数一起在【应用参数】时生效。
+    const HostParams oldHost = m_host;
     m_host = collectHostParams();
     loadHostParamsToWidgets();          // 回填夹取后的值(白场必须大于黑场)
     refreshDisplayImage();              // 立刻看到黑白场效果, 已有结果叠加保留
+
+    // 只改了质量阈值时不需要重新识别: 直接按新阈值重算好坏并重排列表。
+    const bool qualityChanged = oldHost.poorAspect != m_host.poorAspect
+        || oldHost.poorIsoRmsPercent != m_host.poorIsoRmsPercent
+        || oldHost.poorZernikeRmsFactor != m_host.poorZernikeRmsFactor;
+    if (qualityChanged)
+        reclassifyResults();
+
     updateParamDependents();
     saveParamsIni();
     setParamsDirty(false);
 
-    // 现有结果由旧参数产生, 明确提示重新识别。
-    statusBar()->showMessage(m_markers.isEmpty()
-        ? QStringLiteral("参数已应用")
-        : QStringLiteral("参数已应用 —— 点顶部任一识别按钮用新参数重新识别"));
+    // 现有结果由旧参数产生, 明确提示重新识别; 质量分级已即时重排。
+    QString msg = QStringLiteral("参数已应用");
+    if (!m_markers.isEmpty())
+        msg += QStringLiteral(" —— 点顶部任一识别按钮用新参数重新识别");
+    if (qualityChanged && !m_markers.isEmpty())
+        msg += QStringLiteral("（质量分级已按新阈值重排）");
+    statusBar()->showMessage(msg);
 }
 
 void testDetect::onResetParams()
@@ -1839,8 +1929,12 @@ void testDetect::onResetParams()
         // 宿主侧两组同样是高级项: 解锁时才跟着恢复默认, 锁定时保持不动。
         m_host = HostParams();
     }
-    // 「灰度化」在始终可见的分组里, 属于常用项: 锁定时也一起恢复默认。
-    m_host.grayscale = false;
+    // 「灰度化」和「质量分级」在始终可见的分组里, 属于常用项: 锁定时也一起恢复默认。
+    const HostParams hdef;
+    m_host.grayscale = hdef.grayscale;
+    m_host.poorAspect = hdef.poorAspect;
+    m_host.poorIsoRmsPercent = hdef.poorIsoRmsPercent;
+    m_host.poorZernikeRmsFactor = hdef.poorZernikeRmsFactor;
     loadParamsToWidgets(def);
     loadHostParamsToWidgets();     // 控件回填(锁定时只是回到已生效值)
     m_detector.setParams(def);
@@ -1963,10 +2057,15 @@ void testDetect::onLoadParamsFile()
         loadHostParamsToWidgets();
     }
     if (!m_advancedUnlocked) {
-        // 灰度化在始终可见的分组里: 锁定时也从文件读, 其余宿主侧高级项不动。
+        // 灰度化 / 质量分级在始终可见的分组里: 锁定时也从文件读,
+        // 其余宿主侧高级项(图像增强/结果过滤)保持不动。
         HostParams hp = m_host;
-        if (readHostParams(hp, path))
+        if (readHostParams(hp, path)) {
             m_host.grayscale = hp.grayscale;
+            m_host.poorAspect = hp.poorAspect;
+            m_host.poorIsoRmsPercent = hp.poorIsoRmsPercent;
+            m_host.poorZernikeRmsFactor = hp.poorZernikeRmsFactor;
+        }
         loadHostParamsToWidgets();
     }
     loadParamsToWidgets(p);
@@ -2406,7 +2505,9 @@ testDetect::Marker testDetect::createMarker(const DetectionResult& r, bool isMar
     }
     mk.area = resultArea(r);
     // 质量分级: 残差/椭度/是否亚像素三项合并判定, 差的画黄色并沉到列表底部。
-    mk.lowQuality = isLowQualityFit(r, m_detector.params(), mk.major, mk.aspect);
+    mk.isocontour = !r.contourPoints.empty();
+    mk.lowQuality = isLowQualityFit(r.subpixel, mk.isocontour, r.rms, mk.major, mk.aspect,
+                                    m_host, m_detector.params());
 
     // 轮廓: 有阈值等值线就画那一圈平滑曲线(严格经过亚像素边界点);
     // 否则退回拟合椭圆, 再退化按圆。
@@ -2714,6 +2815,23 @@ void testDetect::clearUndoStack()
         }
     }
     m_undoStack.clear();
+}
+
+// 参数栏改了「质量分级」阈值后调用: 用已生效的阈值重算好坏并重排列表。
+// 不重新识别, 只重排显示; 顺序会变, 旧的撤销记录/勾选/ROI 一并作废,
+// 列表行由 finalizeResultMerge() 全量重建。
+void testDetect::reclassifyResults()
+{
+    if (m_markers.isEmpty())
+        return;
+
+    const DetectorParams p = m_detector.params();
+    for (Marker& mk : m_markers) {
+        mk.lowQuality = isLowQualityFit(mk.subpixel, mk.isocontour, mk.rms, mk.major,
+                                        mk.aspect, m_host, p);
+    }
+    clearUndoStack();
+    finalizeResultMerge();
 }
 
 // 删除/撤销后 m_markers 变了, 重新标出"第一条较差结果"的那一行。
