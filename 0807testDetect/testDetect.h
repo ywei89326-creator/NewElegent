@@ -57,6 +57,24 @@ struct CameraProfile {
     QVector<double> D = { 0, 0, 0, 0, 0 };
 };
 
+// 宿主侧参数: 不放进 DetectorParams。
+// DetectorParams 是按值嵌在 TargetDetector 里的结构, 加字段会改变对象布局,
+// 必须同批重编两份头文件 + schneider0807.lib + dll; 这里的规则都只在
+// 进入 DLL 之前/之后做, 与识别算法本身无关。
+struct HostParams {
+    // 结果过滤: 面积窗口(平方像素), 0 = 该方向不限。
+    int  minResultArea = 100;
+    int  maxResultArea = 10000;
+
+    // 检测前图像增强: 黑白场线性拉伸。
+    // 低于黑场的像素压成 0, 高于白场的拉到 255, 中间线性拉伸 —— 目标白底更白、
+    // 环境暗噪声更黑, 让后续二值化/轮廓筛选更容易分干净。
+    // 只在喂给识别器的输入上做(以及显示图), 不改磁盘上的原图。
+    bool enhanceEnable = false;
+    int  enhanceBlack = 0;
+    int  enhanceWhite = 255;
+};
+
 // 主窗口: 导入图片 → 识别 → 结果列表与叠加显示; 勾选结果可连成 ROI。
 // 右下角为识别参数面板(见 buildParamPane); 第二页为懒加载的点云拼接。
 class testDetect : public QMainWindow
@@ -74,8 +92,9 @@ protected:
 private slots:
     void onImportImage();
     void onCameraParams();         // 相机内参/畸变设置(命名保存、复制粘贴)
-    void onStartDetect();          // 识别编码片(原有行为)
-    void onStartDetectMarkers();   // 识别普通标记点(编码片中心圆那种实心亮圆盘)
+    void onStartDetect();          // 识别编码片(编码片优先, 区域内标记点被取代)
+    void onStartDetectMarkers();   // 识别普通标记点(编码片区域内的结果被排除)
+    void onStartDetectAll();       // 识别所有标记点(包含编码片): 一次跑完两类
     void onToggleRoiMode(bool on);
     void onItemChanged(QListWidgetItem* item);
     void onItemClicked(QListWidgetItem* item);
@@ -122,10 +141,20 @@ private:
         QVector<RemovedRow> rows;
     };
 
+    // 手动删除的点(坐标黑名单)。重新识别同一类型时, 与其中一项中心距 ≤ 5px 的
+    // 新结果不再加回列表 —— 用户删掉的干扰点不会因为再点一次识别就复活。
+    // 编码片与标记点分开记: 删掉的标记点不能压制后来在同一位置识别出的编码片。
+    struct DeletedPoint {
+        QPointF pos;
+        bool isMarker = false;
+    };
+
     void buildUi();
     void showImage(const cv::Mat& bgr);
+    void refreshDisplayImage();                          // 只换显示图, 保留结果叠加
+    // 按 m_host 的黑白场把图像拉伸成高对比版本; 未启用时原样返回(浅拷贝)。
+    cv::Mat enhanceImageForDetect(const cv::Mat& src) const;
     void clearResults();
-    void finishDetect(const std::vector<DetectionResult>& results);
     void applyHighlights();
     void updateRoiStatus();
     void updateResultTitle();                             // 标题里的结果计数
@@ -135,6 +164,22 @@ private:
     int removeMarkerRows(QVector<int> rows);
     void clearUndoStack();                                // 丢弃撤销记录并销毁被摘除的图元
     void updateResultButtons();                           // 撤销/导出/删除等结果相关按钮的可用状态
+
+    // ---- 编码片/标记点混合结果 ----
+    // 三个识别入口最终都汇到这里: 只替换被重算的那一类, 另一类按编码片区域/删除黑名单合并。
+    void finishCodedDetect(const std::vector<DetectionResult>& results);
+    void finishMarkerDetect(const std::vector<DetectionResult>& results);
+    void finishDetectAll(const std::vector<DetectionResult>& coded,
+                         const std::vector<DetectionResult>& markers);
+    Marker createMarker(const DetectionResult& r, bool isMarker);
+    void finalizeResultMerge();                           // 重排编号/重建列表行/刷新统计
+    static QString markerRowText(const Marker& mk);       // 结果列表一行文字
+    QString resultSummary() const;                        // "编码片 x 个，标记点 y 个 | ..."
+    bool isResultAreaFiltered(double area) const;         // 面积不在 [最小, 最大] 内, 直接丢弃
+    bool isInCodedRegion(const QPointF& pos) const;       // 落在最近一次编码片区域 4.2R 内
+    bool isDeletedPoint(const QPointF& pos, bool isMarker) const;
+    void rememberDeletedPoint(const QPointF& pos, bool isMarker);
+    void forgetDeletedPoint(const QPointF& pos, bool isMarker);
 
     // ---- 参数设置栏 ----
     void buildParamPane(QWidget* paramPane);
@@ -149,6 +194,8 @@ private:
 
     DetectorParams collectParams() const;                 // 控件 -> 参数集
     void loadParamsToWidgets(const DetectorParams& p);    // 参数集 -> 控件
+    HostParams collectHostParams() const;                 // 控件 -> 宿主侧参数(含夹取)
+    void loadHostParamsToWidgets();                       // 宿主侧参数 -> 控件
     void applyParamsToDetector();                         // 控件 -> setParams -> 落盘
     void setParamsDirty(bool dirty);                      // 更新"未应用"提示
     void updateParamDependents();                         // 参数间的联动禁用
@@ -189,7 +236,6 @@ private:
     bool m_hasImage = false;
     bool m_roiMode = false;          // 「开始画框」是否打开
     bool m_busy = false;
-    bool m_markerMode = false;       // 最近一次识别是否为「识别标记点」(结果列表/状态栏据此换文案)
     bool m_updatingList = false;     // 程序化改列表选中状态时抑制 itemSelectionChanged
     bool m_autoFit = true;           // 用户手动缩放后置 false, 窗口 resize 就不再抢回适应窗口
 
@@ -226,6 +272,19 @@ private:
     // 联动禁用所需的控件(见 updateParamDependents)。
     QGroupBox* m_groupSubpixel = nullptr;
     QGroupBox* m_groupDecode = nullptr;
+
+    // ---- 宿主侧参数(不进 DetectorParams/DLL), 两组都只在高级参数解锁后可见 ----
+    // 图像增强: 检测前黑场/白场拉伸。
+    QGroupBox* m_groupEnhance = nullptr;
+    QCheckBox* m_chkEnhance = nullptr;
+    QSpinBox* m_spinEnhanceBlack = nullptr;
+    QSpinBox* m_spinEnhanceWhite = nullptr;
+    // 结果过滤: 面积窗口, 进列表前丢弃。
+    QGroupBox* m_groupResultFilter = nullptr;
+    QSpinBox* m_spinMinArea = nullptr;
+    QSpinBox* m_spinMaxArea = nullptr;
+
+    HostParams m_host;                         // 已生效的宿主侧参数
     QCheckBox* m_chkSubpixel = nullptr;
     QCheckBox* m_chkOtsu = nullptr;
     QWidget* m_spinFixedThr = nullptr;
@@ -244,9 +303,15 @@ private:
     QPushButton* m_btnCamera = nullptr;    // 【相机参数…】
     QPushButton* m_btnDetect = nullptr;
     QPushButton* m_btnDetectMarkers = nullptr;
+    QPushButton* m_btnDetectAll = nullptr;     // 【识别所有标记点（包含编码片）】
     QPushButton* m_btnRoi = nullptr;
     QPushButton* m_btnFit = nullptr;
     QPushButton* m_btnClear = nullptr;
+
+    // 最近一次编码片识别得到的**原始**结果(不去黑名单), 用来界定 4.2R 编码片区域。
+    // 即使某一行随后被手动删掉, 它的区域仍然有效 —— 否则那个位置会冒出标记点。
+    std::vector<DetectionResult> m_codedRegions;
+    QVector<DeletedPoint> m_deletedPoints;     // 手动删除的坐标黑名单(当前图片内有效)
 
     QVector<Marker> m_markers;
     QPolygonF m_roiPolygon;          // 当前 ROI 多边形(图像像素坐标)

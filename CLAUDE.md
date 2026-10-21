@@ -109,17 +109,38 @@ The UI is built **in code** in `testDetect::buildUi()`. `testDetect.ui` is a nea
 
 - Detection is done by `TargetDetector` from `schneider0807.dll`, held as a member (`m_detector`) so its undistort remap tables are computed once per image size and reused.
 - ⚠ **Never** include `TargetDetector1215.h` alongside `include/TargetDetector.h`. Both define `TargetInfo` / `DetectionResult` / `TargetDetector` in the global namespace with different layouts → C2011 redefinition.
-- Detection runs on a `QThread`; results return to the GUI thread via `QMetaObject::invokeMethod(..., Qt::QueuedConnection)` into `finishDetect()`. The thread handle is a `QPointer<QThread>` because the thread `deleteLater`s itself.
+- Detection runs on a `QThread`; results return to the GUI thread via `QMetaObject::invokeMethod(..., Qt::QueuedConnection)` into `finishCodedDetect` / `finishMarkerDetect` / `finishDetectAll`. The thread handle is a `QPointer<QThread>` because the thread `deleteLater`s itself.
 - **Coordinate-system invariant**: detection results (`DetectionResult::center`) are in the *undistorted* image frame, so the displayed pixmap must be `m_detector.undistortImage(m_srcMat)` — never `m_srcMat` directly, or every overlay shifts.
 - `DetectionResult::subpixel` / `rms` / `nPoints` are the quality triple. `rms` is a **fit residual, not calibrated accuracy** — with a uniform point band its floor is roughly `band/√3 ≈ 0.7px`, so a large value isn't automatically bad. It's usable for *relative* comparison between runs; absolute accuracy needs a repeatability test. Non-sub-pixel results fall back to integer contour centers (~0.3px) and are drawn orange/dashed to make that visible.
 - The ROI polygon is built by sorting the checked targets by polar angle around their centroid, so it can never self-intersect regardless of click order. Checkbox selection means "highlight / participate in ROI"; the polygon is only *drawn* while 画框 mode is on.
+
+#### 编码片 / 标记点混合识别（三个识别按钮）
+
+`开始识别编码片` → `detectTarget`，`识别标记点` → `detectMarkers`（同一套预处理与亚像素精化，但不要求编码环、不解码），
+`识别所有标记点（包含编码片）` → 一次跑完两者。**三个入口都不再清空整张结果列表**，而是只替换被重算的那一类：
+
+- **编码片优先**：「编码片区域」= 编码带外沿 `4.2R`（`kCodedRegionScale`）。点编码片时，新编码片区域内
+  的标记点被删除并由编码片取代，区域外的标记点原样保留；点标记点时，新标记点若落在已有编码片区域内直接丢弃。
+  所以先点标记点还是先点编码片，最终结果一致。
+- 编码片 `ID:n` 排在列表前面，标记点 `M1..Mn` 排在后面（`finalizeResultMerge` 按最终列表顺序重编号）；
+  标题/状态栏用 `resultSummary()` 分别计数：`编码片 12 个，标记点 47 个`。
+- **编码片区域来自最近一次编码片识别的原始结果**（`m_codedRegions`，不经过删除黑名单）：某行被手动删掉后，
+  它的区域仍然有效，否则点标记点会在那个位置冒出一个标记点。
+- **删除黑名单**（`m_deletedPoints`）：右键删除 / 删除干扰点记录坐标 + 类型；之后重算同类时，中心距 ≤5px
+  （`kDeletedPointTol`）的结果不再加回。类型分开记 —— 删掉的标记点不能压制后来在同一位置识别出的编码片
+  （否则“调参后编码片替换标记点”会失效）。撤销删除会把记录从黑名单移除；导入新图 / 应用相机参数时清空。
+- 合并逻辑全在 host 侧（`finishCodedDetect` / `finishMarkerDetect` / `finishDetectAll` + `finalizeResultMerge`），
+  **DLL 接口没有任何改动**，`detectMarkers` 仍返回全图所有实心圆（包括编码片中心圆），区域排除由 host 做。
+- 列表不变量不变：行号 == `m_markers` 下标。合并时 `m_list->clear()` 重建行，所有权仍归 `m_markers`；
+  重算后旧的撤销记录（`clearUndoStack`）和勾选/ROI 状态一并作废。
 
 #### 识别参数（界面上直接调）
 
 Every tuning constant of the algorithm lives in `DetectorParams` (`include/TargetDetector.h`), and the
 **参数设置** pane at the bottom right of tab 1 is its UI: 32 fields in four groups (预处理 / 轮廓筛选 /
-亚像素精化 / 解码与去重). Before this, every threshold was a hardcoded literal in `TargetDetector.cpp`
-and tuning one meant editing source, rebuilding the DLL and restarting.
+亚像素精化 / 解码与去重), plus one **host-side** field in a fifth group 结果过滤. Before this, every
+threshold was a hardcoded literal in `TargetDetector.cpp` and tuning one meant editing source, rebuilding
+the DLL and restarting.
 Per-parameter meaning, tuning direction and a symptom→parameter table live in `参数说明.md` at the
 repo root; the in-app tooltips carry the same conclusions in condensed form.
 
@@ -130,6 +151,31 @@ repo root; the in-app tooltips carry the same conclusions in condensed form.
   `addIntField`/`addDoubleField`/`addBoolField`). Read/write go through a pointer-to-member, so adding
   a parameter needs **three** coordinated edits: the header field, one clamp line in
   `TargetDetector::setParams`, one `addXxxField` line in `buildParamPane`.
+- **图像增强 · 黑场/白场** (advanced-only group 图像增强) is host-side and runs **before** the image
+  is handed to the DLL: `enhanceImageForDetect()` builds a 256-entry LUT
+  (`out = (in-black)*255/(white-black)`, clamped) and applies `cv::LUT`. The three detection slots
+  snapshot the enhanced Mat on the GUI thread *before* spawning the worker, so the tone curve belongs
+  to the same click-time parameter snapshot. The displayed pixmap is enhanced too (`onImportImage`,
+  `applyCameraProfile`, and `refreshDisplayImage()` after 应用参数 / 恢复默认 / 载入参数), which makes
+  tuning visible; `refreshDisplayImage()` only calls `m_pixmapItem->setPixmap`, so existing marker
+  overlays and the list are untouched. The operation is pointwise, so the coordinate frame is
+  unchanged. Off by default (`enhanceEnable=false`); black 0 + white 255 is identity. Persisted as
+  `enhanceEnable` / `enhanceBlack` / `enhanceWhite` in `[detectParams]` (`writeHostParams` /
+  `readHostParams`), and **not** stored in `DetectorParams` for the by-value-layout reason below.
+- **结果过滤 · 最小/最大面积(px²)** is deliberately **not** in `DetectorParams`: that struct is
+  embedded by value in `TargetDetector`, so adding a field would force a synchronized rebuild of both
+  headers, `schneider0807.lib` and `.dll`. The window (`m_minResultArea`, default 100;
+  `m_maxResultArea`, default 10000; 0 = that side is off) lives in the host and is applied in
+  `finishCodedDetect` / `finishMarkerDetect` / `finishDetectAll` through `isResultAreaFiltered(resultArea(r))`
+  (the same area shown in the list/export) **before** a `Marker` is created. Small noise circles
+  (typical 10–50 px²) and large merged/reflection blobs (often >10000 px²) therefore never reach the
+  list, the coded-region logic or the deletion blacklist. Persisted as `minResultArea` /
+  `maxResultArea` (plus the image-enhancement keys) in the same `[detectParams]` ini group via
+  `readHostParams` / `writeHostParams`, they follow 应用参数 / 恢复默认 / 保存参数 / 载入参数 like the
+  other fields,
+  and the whole 结果过滤 group is hidden until advanced parameters are unlocked. They are not
+  registered in `m_fields` (that table is wired to `DetectorParams`); visibility is handled by
+  `m_groupResultFilter`, and `onParamEdited` still marks the pane dirty.
 - `setParams` clamps every field (out-of-range entries keep the old value, no throw) and the host
   re-reads `params()` after applying so the widgets always show what is *actually* in effect.
 - **Snapshot, not live read**: `detectTarget` / `detectTargets` copy the parameters once at entry and
@@ -138,13 +184,29 @@ repo root; the in-app tooltips carry the same conclusions in condensed form.
 - Every default in `DetectorParams` **must** stay equal to the literal it replaced (`defaultParams()`);
   changing a default is a behaviour change. Verify with a before/after run on a sample image — the
   detected ID set, coordinates (3 decimals), `nPoints` and `rms` should be identical.
+- `erodeKernel` accepts **1..21** (the DLL clamp is `paramClampOdd(..., 1, 21)`; the UI range matches).
+  A 1×1 kernel makes `cv::erode` the identity, so **1 means no erosion**. This exists because the
+  subpixel pipeline systematically undershoots on small dots: synthetic white discs calibrate as
+  true R 20→20.3, 12→11.2, 8→6.5, 5→2.45, and a real ~7px marker fits ~5.2.
+- **Threshold-boundary correction** in `refineCenters`: the 7×7 Zernike template biases small circles
+  inward, so `localThresholdEllipse()` re-thresholds a local ROI of the **un-eroded** grayscale
+  (local Otsu, `2R+2` box, radius sanity `0.6R..2.5R`) and fits an ellipse there — that is the
+  colour-threshold jump the user sees. When the Zernike ellipse's area is below `0.81×` that contour
+  (linear ratio <0.9), its axes are scaled up to the threshold contour's area. Center, angle and
+  aspect stay subpixel; `rms`/`nPoints` still describe the unscaled Zernike fit. It is independent of
+  `erodeKernel`, so detection keeps erode=3 for coded-target recall while a real ~7px dot's contour
+  lands at ~6.8 (was 5.2); large targets are unchanged (ratio≈1). If the local contour is missing or
+  implausible it falls back to the initial binary ellipse. Default erode stays 5; 1 only changes
+  behaviour when explicitly selected. This correction is a **DLL change**: rebuild `schneider0807`
+  and redeploy DLL/lib even though the exported header layout is unchanged.
 - ⚠ Two pairs of near-identical numbers that are **not** the same parameter, do not merge them:
   `maxRing` (4.2, contour screening) vs `codeRingOuter` (4.1, decode sampling), and
   `refineBandRatio` (0.18) vs the hardcoded radial step coefficient 0.18 inside `codeBrightAtAngle`.
 - The dependent-disable greying (`updateParamDependents`) is a *hint* only: disabled fields are still
   read by `collectParams()` and passed to the DLL, the algorithm just stops using them.
 - **Two-tier visibility**: default users see only the 8 keys listed in `isBasicParamKey()`; the other
-  24 (all of 亚像素精化 + 解码与去重, plus the geometric ratios in 轮廓筛选) stay hidden until
+  24 (all of 亚像素精化 + 解码与去重, plus the geometric ratios in 轮廓筛选 and the host-side
+  图像增强 / 结果过滤 groups) stay hidden until
   【高级参数…】 receives the owner password. `verifyAdvancedPassword()` stores only an FNV-1a 64
   hash, not the plaintext. Unlock state is deliberately **not** persisted (locked on every launch).
   Hidden widgets are still constructed and keep their values, so `collectParams()`/`saveParamsIni()`
@@ -241,9 +303,10 @@ These are engineered workarounds with comments explaining them — changing them
 - **Whole-row checkbox toggling in the result list**: `QStyledItemDelegate::editorEvent` swallows `MouseButtonPress` when the click lands on the checkbox, so `QListWidget::itemPressed` never fires. Instead `testDetect::eventFilter` records the item and its check state on press; `onItemClicked` compares against that to tell whether Qt already toggled, and only toggles itself when it didn't.
 - **`m_updatingList`** guards every programmatic list mutation to suppress `itemChanged` re-entry.
 - **Labels** (`QGraphicsTextItem`) set `ItemIgnoresTransformations` so ID tags stay a fixed screen size at any zoom; entity sizes (`m_markRadius`, `m_penW`) instead scale with image resolution in `showImage()`.
+- **Marker contour pens are cosmetic** (`applyHighlights`): 1 device px for a normal subpixel result, 1 px dashed orange for non-subpixel, 2 px red when checked. A cosmetic pen ignores the view transform, so zooming in does not thicken the outline over the very edge the user is inspecting.
 - **`m_autoFit`** goes false as soon as the user zooms manually, so a window resize stops snapping back to fit. `eventFilter`'s `Resize` branch must null-check `m_pixmapItem`: `QGraphicsView::fitInView(const QGraphicsItem*, ...)` does not, and dereferences it (crash on startup).
 - Zoom uses `pow(1.0015, delta)` with a clamped range so in/out are exact inverses; the wheel event is consumed so the view doesn't scroll.
 - **Result rows and `m_markers` are 1:1 by index.** The item's `Qt::UserRole` stores the marker index. Both right-click delete and 【删除干扰点】 go through `removeMarkerRows()`, which removes rows **from the highest index down** and rewrites `UserRole` for the rows that shift. Any new list mutation must preserve this invariant.
 - **Undo owns removed graphics.** `removeMarkerRows()` does **not** delete the scene items or the list item: it calls `scene->removeItem()` / `takeItem()` and stores them in `m_undoStack` (max 20 ops). `onUndo()` pops the last op and re-inserts rows **ascending** so the recorded indices stay valid. `clearUndoStack()` is the only owner of still-orphaned items and must run on a new detection (`clearResults()`) and in the destructor; forgetting it leaks, and deleting them on undo double-frees.
 - **Export** writes the remaining `m_markers` in list order to a tab-separated txt with a UTF-8 BOM (`QIODevice::Text` gives CRLF). Columns: type, ID, X, Y, area, aspect, subpixel, RMS, nPoints; coordinates are the undistorted-image frame, 3 decimals.
-- **Outline geometry** stored per result: `area` = π·(w/2)·(h/2) when `hasEllipse`, otherwise π·r²; `major` = long semi-axis; `aspect` = short/long (1 for circles). 【删除干扰点】 opens a dialog to pick one result as a template, then deletes every other result whose **area and aspect** both fall outside `template × (1 ± tolerance)` (default 50%). The preview count updates live; the template is always kept.
+- **Outline geometry** stored per result: `area` = π·(w/2)·(h/2) when `hasEllipse`, otherwise π·r²; `major` = long semi-axis; `aspect` = short/long (1 for circles). 【删除干扰点】 opens a dialog to pick one result as a template, then deletes every other result whose **area** falls outside `template × (1 ± tolerance)` (default 50%). **Aspect is deliberately not used here** (it remains in the export column and in `maxAspect` contour screening) — area alone avoids deleting real targets whose tilt/shape differs. The preview count updates live; the template is always kept.

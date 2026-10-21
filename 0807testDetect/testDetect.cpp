@@ -107,6 +107,91 @@ QPainterPath contourPath(const cv::Point2f& c, double r)
     return p;
 }
 
+// 「编码片区域」= 编码带外沿 × 中心圆半径。中心圆之外的编码带里不会存在真正的
+// 普通标记点, 所以标记点落在区域内一律丢弃, 由编码片取代。
+const double kCodedRegionScale = 4.2;
+
+// 删除黑名单的判定半径(px): 同一目标重复定位的偏差远小于它。
+const double kDeletedPointTol = 5.0;
+
+// 点是否落在 RotatedRect 按 scale 放大后的椭圆内。
+// 旋转按 RotatedRect 的角度约定: 把点转到椭圆局部坐标即旋转 -angle。
+bool pointInScaledEllipse(const cv::RotatedRect& e, double scale, const QPointF& p)
+{
+    if (e.size.width <= 0.f || e.size.height <= 0.f)
+        return false;
+    const double a = e.size.width * 0.5 * scale;
+    const double b = e.size.height * 0.5 * scale;
+    const double th = e.angle * CV_PI / 180.0;
+    const double ct = std::cos(th), st = std::sin(th);
+    const double dx = p.x() - e.center.x;
+    const double dy = p.y() - e.center.y;
+    const double xr = dx * ct + dy * st;
+    const double yr = -dx * st + dy * ct;
+    return (xr * xr) / (a * a) + (yr * yr) / (b * b) <= 1.0;
+}
+
+double dist2(const QPointF& a, const QPointF& b)
+{
+    const double dx = a.x() - b.x();
+    const double dy = a.y() - b.y();
+    return dx * dx + dy * dy;
+}
+
+// 与结果列表/导出里的面积口径完全一致: 有拟合椭圆用长短半轴, 否则用半径(至少 1px)。
+double resultArea(const DetectionResult& r)
+{
+    if (r.hasEllipse && r.ellipse.size.width > 0 && r.ellipse.size.height > 0)
+        return CV_PI * (r.ellipse.size.width * 0.5) * (r.ellipse.size.height * 0.5);
+    const double rr = qMax((double)r.radius, 1.0);
+    return CV_PI * rr * rr;
+}
+
+// 宿主侧参数不在 DetectorParams 里(那是 DLL 的按值结构, 改布局要同批重编 lib/dll),
+// 但和识别参数放在同一个 [detectParams] 分组, 参数文件仍是"一个文件搞定"。
+void writeHostParams(const HostParams& h, const QString& path)
+{
+    QSettings s(path, QSettings::IniFormat);
+    s.beginGroup(QStringLiteral("detectParams"));
+    s.setValue(QStringLiteral("minResultArea"), h.minResultArea);
+    s.setValue(QStringLiteral("maxResultArea"), h.maxResultArea);
+    s.setValue(QStringLiteral("enhanceEnable"), h.enhanceEnable ? 1 : 0);
+    s.setValue(QStringLiteral("enhanceBlack"), h.enhanceBlack);
+    s.setValue(QStringLiteral("enhanceWhite"), h.enhanceWhite);
+    s.endGroup();
+    s.sync();
+}
+
+// 缺键的项保持 h 的现值(调用方先用默认值打底), 兼容旧版 settings.ini/参数文件。
+bool readHostParams(HostParams& h, const QString& path)
+{
+    QSettings s(path, QSettings::IniFormat);
+    if (s.status() != QSettings::NoError)
+        return false;
+    s.beginGroup(QStringLiteral("detectParams"));
+    bool any = false;
+    auto readInt = [&](const QString& key, int lo, int hi, int& out) {
+        if (!s.contains(key))
+            return;
+        bool ok = false;
+        const int v = s.value(key).toInt(&ok);
+        if (ok) {
+            out = qBound(lo, v, hi);
+            any = true;
+        }
+    };
+    readInt(QStringLiteral("minResultArea"), 0, 1000000, h.minResultArea);
+    readInt(QStringLiteral("maxResultArea"), 0, 1000000, h.maxResultArea);
+    readInt(QStringLiteral("enhanceBlack"), 0, 254, h.enhanceBlack);
+    readInt(QStringLiteral("enhanceWhite"), 1, 255, h.enhanceWhite);
+    if (s.contains(QStringLiteral("enhanceEnable"))) {
+        h.enhanceEnable = s.value(QStringLiteral("enhanceEnable")).toInt() != 0;
+        any = true;
+    }
+    s.endGroup();
+    return any;
+}
+
 // 多边形面积(鞋带公式), 单位: 平方像素。
 double polygonArea(const QPolygonF& poly)
 {
@@ -295,7 +380,13 @@ void testDetect::buildUi()
     m_btnDetectMarkers = new QPushButton(QStringLiteral("识别标记点"), tabDetect);
     m_btnDetectMarkers->setToolTip(QStringLiteral(
         "识别普通圆形标记点（实心亮圆盘，即编码片中心圆）。\n"
-        "算法与「开始识别编码片」相同，但不要求外围有编码环，也不解码 ID。"));
+        "算法与「开始识别编码片」相同，但不要求外围有编码环，也不解码 ID。\n"
+        "落在已识别编码片区域内的标记点会被排除；已识别的编码片保留。"));
+    // 一次跑完两类: 编码片优先, 标记点不含编码片区域内的。
+    m_btnDetectAll = new QPushButton(QStringLiteral("识别所有标记点（包含编码片）"), tabDetect);
+    m_btnDetectAll->setToolTip(QStringLiteral(
+        "一次完成「开始识别编码片」+「识别标记点」。\n"
+        "结果列表里编码片显示 ID:n，普通标记点显示 M1..Mn。"));
     m_btnRoi = new QPushButton(QStringLiteral("开始画框"), tabDetect);
     m_btnRoi->setCheckable(true);
     m_btnClear = new QPushButton(QStringLiteral("清空选择"), tabDetect);
@@ -307,6 +398,7 @@ void testDetect::buildUi()
     bar->addWidget(m_btnCamera);
     bar->addWidget(m_btnDetect);
     bar->addWidget(m_btnDetectMarkers);
+    bar->addWidget(m_btnDetectAll);
     bar->addWidget(m_btnRoi);
     bar->addSpacing(24);
     bar->addWidget(m_btnClear);
@@ -349,7 +441,7 @@ void testDetect::buildUi()
     // 标题行右侧: 按面积批量删除误识别的小圈, 无结果时禁用。
     m_btnRemoveNoise = new QPushButton(QStringLiteral("删除干扰点"), central);
     m_btnRemoveNoise->setToolTip(QStringLiteral(
-        "选一个正确识别的点作为模板, 删除与它轮廓面积/形状相差较大的结果。\n"
+        "选一个正确识别的点作为模板, 删除与它轮廓面积相差较大的结果。\n"
         "点击后在弹窗中选择模板并调整允许偏差。"));
     m_btnRemoveNoise->setEnabled(false);
 
@@ -431,6 +523,7 @@ void testDetect::buildUi()
     connect(m_btnCamera, &QPushButton::clicked, this, &testDetect::onCameraParams);
     connect(m_btnDetect, &QPushButton::clicked, this, &testDetect::onStartDetect);
     connect(m_btnDetectMarkers, &QPushButton::clicked, this, &testDetect::onStartDetectMarkers);
+    connect(m_btnDetectAll, &QPushButton::clicked, this, &testDetect::onStartDetectAll);
     connect(m_btnRoi, &QPushButton::toggled, this, &testDetect::onToggleRoiMode);
     connect(m_btnClear, &QPushButton::clicked, this, &testDetect::onClearSelection);
     connect(m_btnFit, &QPushButton::clicked, this, &testDetect::onFitView);
@@ -459,6 +552,7 @@ void testDetect::buildUi()
 
     m_btnDetect->setEnabled(false);
     m_btnDetectMarkers->setEnabled(false);
+    m_btnDetectAll->setEnabled(false);
     m_btnRoi->setEnabled(false);
     m_btnClear->setEnabled(false);
 
@@ -568,10 +662,10 @@ void testDetect::applyCameraProfile(const CameraProfile& p)
         return;
     }
 
-    // 坐标系已经改变: 旧结果和旧显示图都作废, 重新去畸变并提示重新识别。
+    // 坐标系已经改变: 旧结果和旧显示图都作废, 重新去畸变(含黑白场增强)并提示重新识别。
     clearResults();
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    const cv::Mat disp = m_detector.undistortImage(m_srcMat);
+    const cv::Mat disp = enhanceImageForDetect(m_detector.undistortImage(m_srcMat));
     QApplication::restoreOverrideCursor();
     showImage(disp);
     m_btnRoi->setChecked(false);
@@ -1009,13 +1103,20 @@ void testDetect::buildParamPane(QWidget* paramPane)
     QFormLayout* fCirc = nullptr;
     QFormLayout* fSub = nullptr;
     QFormLayout* fDec = nullptr;
+    QFormLayout* fEnh = nullptr;
+    QFormLayout* fFilter = nullptr;
     il->addWidget(makeParamGroup(inner, QStringLiteral("预处理"), &fPre));
     il->addWidget(makeParamGroup(inner, QStringLiteral("轮廓筛选"), &fCirc));
     m_groupSubpixel = makeParamGroup(inner, QStringLiteral("亚像素精化"), &fSub);
     il->addWidget(m_groupSubpixel);
-    // 这两组全部是高级参数, 锁定时整组隐藏。
+    // 这两组(结果过滤里的项也是)全部是高级参数, 锁定时整组隐藏。
     m_groupDecode = makeParamGroup(inner, QStringLiteral("解码与去重"), &fDec);
     il->addWidget(m_groupDecode);
+    // 宿主侧参数: 不进 DetectorParams/DLL, 单独两组放在最后。
+    m_groupEnhance = makeParamGroup(inner, QStringLiteral("图像增强"), &fEnh);
+    il->addWidget(m_groupEnhance);
+    m_groupResultFilter = makeParamGroup(inner, QStringLiteral("结果过滤"), &fFilter);
+    il->addWidget(m_groupResultFilter);
 
     // ---- 预处理 ----
     m_chkOtsu = addBoolField(fPre, QStringLiteral("useOtsu"), QStringLiteral("大津法"),
@@ -1032,11 +1133,13 @@ void testDetect::buildParamPane(QWidget* paramPane)
                        "方向: 调到中心圆盘是完整白块、背景基本全黑为止。"),
         1, 254, &DetectorParams::fixedThreshold);
     addIntField(fPre, QStringLiteral("erodeKernel"), QStringLiteral("腐蚀核"),
-        QStringLiteral("腐蚀操作的结构元边长(奇数, 默认 5; 偶数会自动夹成奇数)。\n"
+        QStringLiteral("腐蚀操作的结构元边长(奇数, 默认 5; 偶数会自动夹成奇数, 范围 1~21)。\n"
                        "调大 → 白色区域被啃得更瘦, 细窄的反光条纹/毛刺先消失, 误检减少;\n"
                        "但过大也会把编码块啃断、把中心盘啃小(半径 R 变小)。\n"
-                       "远距离小靶标、编码块很细时必须调小到 3。"),
-        3, 21, &DetectorParams::erodeKernel);
+                       "小目标请调小: 半径 ≤8px 的白点经 3x3 腐蚀后轮廓会比真实边缘小一圈,\n"
+                       "亚像素拟合也会跟着缩进去；调到 1 表示不腐蚀, 轮廓能更贴合白点。\n"
+                       "代价是反光条纹/相邻白斑更容易连成一片, 误检可能增多, 按图取舍。"),
+        1, 21, &DetectorParams::erodeKernel);
     addDoubleField(fPre, QStringLiteral("bigBlobAreaRatio"), QStringLiteral("大块白斑"),
         QStringLiteral("剔除大面积白色连通域的面积占比阈值(默认 0.02 = 全图 2%)。\n"
                        "连通域面积 ≥ 该比例 × 全图面积就整个删掉(只删它自己的像素)。\n"
@@ -1214,6 +1317,87 @@ void testDetect::buildParamPane(QWidget* paramPane)
                        "相邻很近的靶标被误合并时调小(5~8)。"),
         1.0, 1000.0, 1, &DetectorParams::minGapRadii);
 
+    // ---- 图像增强(宿主侧) ----
+    // 同样不注册进 m_fields; 整组显隐由 applyParamVisibility 控制。
+    m_chkEnhance = new QCheckBox(m_groupEnhance);
+    m_chkEnhance->setToolTip(QStringLiteral(
+        "检测前按黑白场把图像拉伸成高对比版本: 目标白底更白、环境暗噪声更黑。\n"
+        "只影响喂给识别器的输入和界面显示, 不改磁盘上的原图;\n"
+        "它是逐像素点运算, 不移动任何坐标, 识别结果仍能正确叠加。\n"
+        "默认关闭 —— 关闭时识别结果与以前完全一致。"));
+    fEnh->addRow(QStringLiteral("启用增强"), m_chkEnhance);
+    connect(m_chkEnhance, &QCheckBox::toggled, this, &testDetect::onParamEdited);
+
+    m_spinEnhanceBlack = new QSpinBox(m_groupEnhance);
+    m_spinEnhanceBlack->setRange(0, 254);
+    m_spinEnhanceBlack->setAccelerated(true);
+    m_spinEnhanceBlack->setKeyboardTracking(false);
+    m_spinEnhanceBlack->setFixedWidth(96);
+    m_spinEnhanceBlack->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_spinEnhanceBlack->setToolTip(QStringLiteral(
+        "黑场(灰度 0~254, 默认 0 = 不压): 低于它的像素直接变成纯黑。\n"
+        "用途: 背景纹理/反光条纹的灰度明显低于目标白底时, 把黑场提到两者之间,\n"
+        "环境干扰先被压成一片黑, 轮廓筛选更容易分干净。\n"
+        "例如背景约 60、目标白底约 230, 可先试黑场 80~100。\n"
+        "必须小于白场; 设得过高会把目标暗部一起压掉。"));
+    fEnh->addRow(QStringLiteral("黑场(灰度)"), m_spinEnhanceBlack);
+    connect(m_spinEnhanceBlack, QOverload<int>::of(&QSpinBox::valueChanged),
+        this, &testDetect::onParamEdited);
+
+    m_spinEnhanceWhite = new QSpinBox(m_groupEnhance);
+    m_spinEnhanceWhite->setRange(1, 255);
+    m_spinEnhanceWhite->setAccelerated(true);
+    m_spinEnhanceWhite->setKeyboardTracking(false);
+    m_spinEnhanceWhite->setFixedWidth(96);
+    m_spinEnhanceWhite->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_spinEnhanceWhite->setToolTip(QStringLiteral(
+        "白场(灰度 1~255, 默认 255 = 不拉): 高于它的像素直接变成纯白。\n"
+        "用途: 目标白底不够纯、边缘发灰时, 把白场降到白底灰度附近,\n"
+        "中心圆盘会变成干净的实心白块。例如白底约 230, 可先试白场 200~220。\n"
+        "注意: 白场过低会让白斑变大/粘连, 反而影响半径与面积; 必须大于黑场。"));
+    fEnh->addRow(QStringLiteral("白场(灰度)"), m_spinEnhanceWhite);
+    connect(m_spinEnhanceWhite, QOverload<int>::of(&QSpinBox::valueChanged),
+        this, &testDetect::onParamEdited);
+
+    // ---- 结果过滤(宿主侧) ----
+    // 不注册进 m_fields: 它不写 DetectorParams, 否则 collectParams/载入参数文件
+    // 会把它当成 DLL 参数来回倒。显隐由整组控制, 脏标记由 onParamEdited 处理。
+    m_spinMinArea = new QSpinBox(m_groupResultFilter);
+    m_spinMinArea->setRange(0, 1000000);
+    m_spinMinArea->setAccelerated(true);
+    m_spinMinArea->setKeyboardTracking(false);   // 输入落定才发信号
+    m_spinMinArea->setFixedWidth(96);
+    m_spinMinArea->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_spinMinArea->setToolTip(QStringLiteral(
+        "识别结果面积小于该值(平方像素)时, 在进入结果列表前直接丢弃。\n"
+        "作用对象是编码片和标记点两类结果, 相当于自动做一遍「删除干扰点」,\n"
+        "省得每次手动删小噪点。0 = 不过滤。\n"
+        "默认 100: 典型干扰轮廓(毛刺/反光点)面积常在 10~50,\n"
+        "而正常靶标中心圆随相机距离不同通常在几百到几千。\n"
+        "判断依据就是结果列表里显示的「面积」列, 可以先不过滤跑一次看看分布再定。\n"
+        "注意: 调得过大, 远距离的小靶标也会被一起滤掉。"));
+    fFilter->addRow(QStringLiteral("最小面积(px^2)"), m_spinMinArea);
+    connect(m_spinMinArea, QOverload<int>::of(&QSpinBox::valueChanged),
+        this, &testDetect::onParamEdited);
+
+    m_spinMaxArea = new QSpinBox(m_groupResultFilter);
+    m_spinMaxArea->setRange(0, 1000000);
+    m_spinMaxArea->setAccelerated(true);
+    m_spinMaxArea->setKeyboardTracking(false);
+    m_spinMaxArea->setFixedWidth(96);
+    m_spinMaxArea->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_spinMaxArea->setToolTip(QStringLiteral(
+        "识别结果面积大于该值(平方像素)时, 在进入结果列表前直接丢弃。0 = 不设上限。\n"
+        "默认 10000: 正常靶标中心圆通常几百到几千; 超过一万的多是\n"
+        "大面积反光/工件面被当成圆盘, 或几个白斑粘连成的大块。\n"
+        "它与「最小面积」一起构成一个面积窗口: 小于下限或大于上限的结果都不显示。\n"
+        "注意: 上限必须大于下限, 且 0 表示不设上限(不是“全删”)。"));
+    fFilter->addRow(QStringLiteral("最大面积(px^2)"), m_spinMaxArea);
+    connect(m_spinMaxArea, QOverload<int>::of(&QSpinBox::valueChanged),
+        this, &testDetect::onParamEdited);
+
+    loadHostParamsToWidgets();     // 初始化两组宿主侧控件的值
+
     il->addStretch(1);
     m_paramScroll->setWidget(inner);
     v->addWidget(m_paramScroll, 1);
@@ -1233,7 +1417,7 @@ void testDetect::buildParamPane(QWidget* paramPane)
     btns->addWidget(m_btnLoadParams, 1, 1);
     // 高级参数入口: 锁定时只显示此按钮, 密码正确才展开全部参数。
     m_btnUnlock = new QPushButton(QStringLiteral("高级参数…"), paramPane);
-    m_btnUnlock->setToolTip(QStringLiteral("输入密码后显示全部 32 项参数。\n"
+    m_btnUnlock->setToolTip(QStringLiteral("输入密码后显示全部参数（32 项识别参数 + 图像增强/结果过滤）。\n"
                                            "默认用户只需调上面那几项常用参数。"));
     btns->addWidget(m_btnUnlock, 2, 0, 1, 2);
     v->addLayout(btns);
@@ -1281,6 +1465,44 @@ void testDetect::loadParamsToWidgets(const DetectorParams& p)
     m_updatingParams = false;
 }
 
+// 宿主侧参数: 控件 -> 参数集。缺控件时沿用已生效值。
+HostParams testDetect::collectHostParams() const
+{
+    HostParams h = m_host;
+    if (m_chkEnhance)
+        h.enhanceEnable = m_chkEnhance->isChecked();
+    if (m_spinEnhanceBlack)
+        h.enhanceBlack = m_spinEnhanceBlack->value();
+    if (m_spinEnhanceWhite)
+        h.enhanceWhite = m_spinEnhanceWhite->value();
+    if (m_spinMinArea)
+        h.minResultArea = m_spinMinArea->value();
+    if (m_spinMaxArea)
+        h.maxResultArea = m_spinMaxArea->value();
+    // 白场必须大于黑场, 否则整张图没有中间调; 夹到黑场 +1 并回填控件。
+    if (h.enhanceWhite <= h.enhanceBlack)
+        h.enhanceWhite = qMin(255, h.enhanceBlack + 1);
+    return h;
+}
+
+// 宿主侧参数: 参数集 -> 控件。两组的显隐仍由 applyParamVisibility 控制。
+void testDetect::loadHostParamsToWidgets()
+{
+    m_updatingParams = true;
+    if (m_chkEnhance)
+        m_chkEnhance->setChecked(m_host.enhanceEnable);
+    if (m_spinEnhanceBlack)
+        m_spinEnhanceBlack->setValue(m_host.enhanceBlack);
+    if (m_spinEnhanceWhite)
+        m_spinEnhanceWhite->setValue(m_host.enhanceWhite);
+    if (m_spinMinArea)
+        m_spinMinArea->setValue(m_host.minResultArea);
+    if (m_spinMaxArea)
+        m_spinMaxArea->setValue(m_host.maxResultArea);
+    m_updatingParams = false;
+    updateParamDependents();
+}
+
 void testDetect::onParamEdited()
 {
     if (m_updatingParams)
@@ -1307,7 +1529,7 @@ void testDetect::setParamsDirty(bool dirty)
     if (m_paramHint) {
         m_paramHint->setText(dirty
             ? QStringLiteral("参数已改动，点「应用参数」生效")
-            : QStringLiteral("参数已生效；改动后需点「开始识别编码片」或「识别标记点」重新识别"));
+            : QStringLiteral("参数已生效；改动后需点顶部任一识别按钮重新识别"));
         // 动态状态无法用 QSS 选择器表达, 只能在代码里设色。
         m_paramHint->setStyleSheet(QStringLiteral("color:%1;")
             .arg(QLatin1String(dirty ? kHintColorDirty : kHintColorIdle)));
@@ -1330,6 +1552,14 @@ void testDetect::updateParamDependents()
                 f.w->setEnabled(on);
         }
     }
+    // 未启用图像增强时, 黑白场不参与任何计算, 置灰避免白调。
+    if (m_chkEnhance) {
+        const bool on = m_chkEnhance->isChecked();
+        if (m_spinEnhanceBlack)
+            m_spinEnhanceBlack->setEnabled(on);
+        if (m_spinEnhanceWhite)
+            m_spinEnhanceWhite->setEnabled(on);
+    }
 }
 
 // ---------------------------------------------------------------- 参数权限
@@ -1351,6 +1581,8 @@ void testDetect::setAdvancedUnlocked(bool on)
                 setWidgetValue(f.w, f.read(cur));
         }
         m_updatingParams = false;
+        // 宿主侧两组(图像增强/结果过滤)也不在 m_fields 里, 单独回滚到已生效值。
+        loadHostParamsToWidgets();
 
         // 只统计常用项上的未应用改动。
         setParamsDirty(m_basicDirty);
@@ -1375,6 +1607,10 @@ void testDetect::applyParamVisibility()
         m_groupSubpixel->setVisible(m_advancedUnlocked);
     if (m_groupDecode)
         m_groupDecode->setVisible(m_advancedUnlocked);
+    if (m_groupEnhance)
+        m_groupEnhance->setVisible(m_advancedUnlocked);
+    if (m_groupResultFilter)
+        m_groupResultFilter->setVisible(m_advancedUnlocked);
 
     // 字段与其 QFormLayout 标签一起显隐; 空行会被布局跳过。
     for (const ParamField& f : m_fields) {
@@ -1419,6 +1655,10 @@ void testDetect::onApplyParams()
     m_detector.setParams(wanted);            // DLL 侧还会再夹取一次范围
     // 回读实际生效值, 保证界面与算法一致(例如腐蚀核填偶数会被夹成奇数)。
     loadParamsToWidgets(m_detector.params());
+    // 宿主侧参数(图像增强/面积窗口): 与 DLL 参数一起在【应用参数】时生效。
+    m_host = collectHostParams();
+    loadHostParamsToWidgets();          // 回填夹取后的值(白场必须大于黑场)
+    refreshDisplayImage();              // 立刻看到黑白场效果, 已有结果叠加保留
     updateParamDependents();
     saveParamsIni();
     setParamsDirty(false);
@@ -1426,7 +1666,7 @@ void testDetect::onApplyParams()
     // 现有结果由旧参数产生, 明确提示重新识别。
     statusBar()->showMessage(m_markers.isEmpty()
         ? QStringLiteral("参数已应用")
-        : QStringLiteral("参数已应用 —— 点「开始识别编码片」或「识别标记点」用新参数重新识别"));
+        : QStringLiteral("参数已应用 —— 点顶部任一识别按钮用新参数重新识别"));
 }
 
 void testDetect::onResetParams()
@@ -1440,8 +1680,14 @@ void testDetect::onResetParams()
                 f.write(def, f.read(cur));
         }
     }
+    else {
+        // 宿主侧两组同样是高级项: 解锁时才跟着恢复默认, 锁定时保持不动。
+        m_host = HostParams();
+    }
     loadParamsToWidgets(def);
+    loadHostParamsToWidgets();     // 控件回填(锁定时只是回到已生效值)
     m_detector.setParams(def);
+    refreshDisplayImage();         // 增强恢复默认后, 显示图也要还原
     updateParamDependents();
     saveParamsIni();          // 默认值同样落盘, 否则下次启动会读回旧参数
     setParamsDirty(false);
@@ -1500,6 +1746,7 @@ void testDetect::saveParamsIni()
 {
     writeParamsToSettings(m_detector.params(), m_fields,
         QStringLiteral("detectParams"), paramsIniPath());
+    writeHostParams(m_host, paramsIniPath());
 }
 
 bool testDetect::loadParamsIni()
@@ -1507,6 +1754,12 @@ bool testDetect::loadParamsIni()
     DetectorParams p = TargetDetector::defaultParams();
     if (!readParamsFromSettings(p, m_fields, QStringLiteral("detectParams"), paramsIniPath()))
         return false;
+
+    // 宿主侧参数: 缺键时用出厂默认(兼容旧版 settings.ini)。
+    m_host = HostParams();
+    readHostParams(m_host, paramsIniPath());
+    loadHostParamsToWidgets();
+
     loadParamsToWidgets(p);
     m_detector.setParams(p);
     loadParamsToWidgets(m_detector.params());   // 夹取后的真实值回填控件
@@ -1521,6 +1774,7 @@ void testDetect::onSaveParamsFile()
         return;
     // 保存控件中的当前值(含未应用改动), 所见即所存。
     writeParamsToSettings(collectParams(), m_fields, QStringLiteral("detectParams"), path);
+    writeHostParams(collectHostParams(), path);
     statusBar()->showMessage(QStringLiteral("参数已保存到 %1").arg(path));
 }
 
@@ -1545,9 +1799,16 @@ void testDetect::onLoadParamsFile()
                 f.write(p, f.read(cur));
         }
     }
+    else {
+        // 宿主侧两组是高级项: 解锁时从文件读, 文件没有的键回出厂默认。
+        m_host = HostParams();
+        readHostParams(m_host, path);
+        loadHostParamsToWidgets();
+    }
     loadParamsToWidgets(p);
     m_detector.setParams(p);
     loadParamsToWidgets(m_detector.params());
+    refreshDisplayImage();
     updateParamDependents();
     saveParamsIni();              // 载入即视为当前配置, 同步写入 settings.ini
     setParamsDirty(false);
@@ -1558,7 +1819,7 @@ void testDetect::onLoadParamsFile()
             : QStringLiteral("参数已载入：%1（高级参数保持不变）").arg(name));
     }
     else {
-        statusBar()->showMessage(QStringLiteral("参数已载入：%1 —— 点「开始识别编码片」或「识别标记点」重新识别").arg(name));
+        statusBar()->showMessage(QStringLiteral("参数已载入：%1 —— 点顶部任一识别按钮重新识别").arg(name));
     }
 }
 
@@ -1617,8 +1878,9 @@ void testDetect::onImportImage()
     m_hasImage = true;
 
     // 识别坐标位于去畸变坐标系, 显示图必须同源, 否则叠加会整体偏移。
+    // 显示的是"增强后"的图, 与喂给识别器的输入观感一致, 便于调黑白场。
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    const cv::Mat disp = m_detector.undistortImage(m_srcMat);
+    const cv::Mat disp = enhanceImageForDetect(m_detector.undistortImage(m_srcMat));
     QApplication::restoreOverrideCursor();
 
     clearResults();
@@ -1629,6 +1891,47 @@ void testDetect::onImportImage()
 
     statusBar()->showMessage(QStringLiteral("已载入 %1   (%2 x %3)")
         .arg(QFileInfo(path).fileName()).arg(raw.cols).arg(raw.rows));
+}
+
+// 黑白场线性拉伸: 低于 black 的压成 0, 高于 white 的拉到 255, 中间线性。
+// 结果是一张 256 项 LUT 的点运算, 不改变任何像素坐标, 所以识别结果仍能对得上。
+// 未启用/参数退化(0..255)时原样返回(浅拷贝, 不复制像素)。
+cv::Mat testDetect::enhanceImageForDetect(const cv::Mat& src) const
+{
+    if (src.empty() || !m_host.enhanceEnable)
+        return src;
+    const int lo = m_host.enhanceBlack;
+    const int hi = m_host.enhanceWhite;
+    if (hi <= lo || (lo <= 0 && hi >= 255))
+        return src;
+
+    cv::Mat lut(1, 256, CV_8U);
+    const double scale = 255.0 / (hi - lo);
+    for (int i = 0; i < 256; ++i) {
+        const int v = (int)std::lround((i - lo) * scale);
+        lut.at<uchar>(0, i) = (uchar)qBound(0, v, 255);
+    }
+    cv::Mat out;
+    cv::LUT(src, lut, out);
+    return out;
+}
+
+// 只替换显示 pixmap, 不动结果图元/列表 —— 用于【应用参数】后立刻看到黑白场效果。
+void testDetect::refreshDisplayImage()
+{
+    if (!m_hasImage || !m_pixmapItem)
+        return;
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const cv::Mat disp = enhanceImageForDetect(m_detector.undistortImage(m_srcMat));
+    QApplication::restoreOverrideCursor();
+    if (disp.empty())
+        return;
+
+    cv::Mat rgb;
+    cv::cvtColor(disp, rgb, cv::COLOR_BGR2RGB);
+    const QImage img(rgb.data, rgb.cols, rgb.rows, (int)rgb.step, QImage::Format_RGB888);
+    m_pixmapItem->setPixmap(QPixmap::fromImage(img.copy()));
 }
 
 void testDetect::showImage(const cv::Mat& bgr)
@@ -1664,49 +1967,67 @@ void testDetect::showImage(const cv::Mat& bgr)
 }
 
 
-// ---------------------------------------------------------------- 开始识别编码片
+// ---------------------------------------------------------------- 识别入口
+//
+// 三个按钮共用一套合并规则: **只重算被点的那一类**, 另一类保留;
+// 「编码片区域」= 编码带外沿 4.2R, 区域内的普通标记点一律由编码片取代。
+// 这样先识别哪一类都不会互相清空, 而编码片永远优先。
 
 void testDetect::onStartDetect()
 {
     if (!m_hasImage || m_busy)
         return;
 
-    m_markerMode = false;       // 编码片模式: 标签显示 ID:n
-    clearResults();
+    // 编码片优先: 全图重新识别编码片, 旧编码片整类替换;
+    // 新编码片区域(4.2R)内的标记点删除并由编码片取代, 区域外的标记点保留。
     setBusy(true);
-    statusBar()->showMessage(QStringLiteral("识别中…"));
+    statusBar()->showMessage(QStringLiteral("识别编码片中…"));
 
-    cv::Mat input = m_srcMat;   // 浅拷贝共享像素, 工作线程只读
+    // 识别输入按已生效的黑白场增强; 未启用时是浅拷贝, 新图时是增强后的新 Mat。
+    // 在主线程算好再交给工作线程, 参数取的是点击这一刻的快照。
+    cv::Mat input = enhanceImageForDetect(m_srcMat);
     m_thread = QThread::create([this, input]() mutable {
-        const std::vector<DetectionResult> results = m_detector.detectTarget(input);
+        std::vector<DetectionResult> results;
+        try {
+            results = m_detector.detectTarget(input);
+        }
+        catch (const std::exception& e) {
+            // 异常不能穿出线程函数(会 std::terminate), 也不能让界面停在 busy。
+            const QString msg = QString::fromLocal8Bit(e.what());
+            QMetaObject::invokeMethod(this, [this, msg]() {
+                setBusy(false);
+                statusBar()->showMessage(QStringLiteral("编码片识别失败"));
+                QMessageBox::warning(this, QStringLiteral("识别失败"), msg);
+            }, Qt::QueuedConnection);
+            return;
+        }
         // 切回 GUI 线程再更新界面
-        QMetaObject::invokeMethod(this, [this, results]() { finishDetect(results); },
+        QMetaObject::invokeMethod(this, [this, results]() { finishCodedDetect(results); },
                                   Qt::QueuedConnection);
     });
     connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
     m_thread->start();
 }
 
-// 与 onStartDetect 相同的线程模型, 调用 detectMarkers。
-// 不做解码, 结果 id 恒为 -1, 界面序号由 finishDetect 生成。
+// 只重算标记点: 已识别的编码片保留, 落在编码片区域内的新标记点丢弃。
+// 标记点没有编码 ID(DLL 返回 -1), 界面序号在 finalizeResultMerge 里按列表顺序生成。
 void testDetect::onStartDetectMarkers()
 {
     if (!m_hasImage || m_busy)
         return;
 
-    m_markerMode = true;
-    clearResults();
     setBusy(true);
     statusBar()->showMessage(QStringLiteral("标记点识别中…"));
 
-    cv::Mat input = m_srcMat;   // 浅拷贝共享像素, 工作线程只读
+    // 识别输入按已生效的黑白场增强; 未启用时是浅拷贝, 新图时是增强后的新 Mat。
+    // 在主线程算好再交给工作线程, 参数取的是点击这一刻的快照。
+    cv::Mat input = enhanceImageForDetect(m_srcMat);
     m_thread = QThread::create([this, input]() mutable {
         std::vector<DetectionResult> results;
         try {
             results = m_detector.detectMarkers(input);
         }
         catch (const std::exception& e) {
-            // 异常不能穿出线程函数(会 std::terminate), 也不能让界面停在 busy。
             const QString msg = QString::fromLocal8Bit(e.what());
             QMetaObject::invokeMethod(this, [this, msg]() {
                 setBusy(false);
@@ -1715,118 +2036,355 @@ void testDetect::onStartDetectMarkers()
             }, Qt::QueuedConnection);
             return;
         }
-        QMetaObject::invokeMethod(this, [this, results]() { finishDetect(results); },
+        QMetaObject::invokeMethod(this, [this, results]() { finishMarkerDetect(results); },
                                   Qt::QueuedConnection);
     });
     connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
     m_thread->start();
 }
 
-void testDetect::finishDetect(const std::vector<DetectionResult>& results)
+// 一次跑完两类: 先编码片, 再标记点(标记点按本次编码片区域排除)。
+void testDetect::onStartDetectAll()
 {
-    m_updatingList = true;
-    for (size_t i = 0; i < results.size(); ++i) {
-        const DetectionResult& r = results[i];
+    if (!m_hasImage || m_busy)
+        return;
 
-        Marker mk;
-        // 标记点无编码 ID(DLL 返回 -1), 用 1 起的序号作为界面标识。
-        mk.id = m_markerMode ? (int)i + 1 : (int)r.id;
-        mk.isMarker = m_markerMode;
-        mk.pos = QPointF(r.center.x, r.center.y);
-        mk.subpixel = r.subpixel;
-        mk.rms = r.rms;
-        mk.nPoints = r.nPoints;
-        // 几何描述取实际绘制的轮廓: 有拟合椭圆用椭圆, 否则用圆。
-        if (r.hasEllipse && r.ellipse.size.width > 0 && r.ellipse.size.height > 0) {
-            const double w = r.ellipse.size.width;
-            const double h = r.ellipse.size.height;
-            mk.major = qMax(w, h) * 0.5;
-            mk.aspect = (mk.major > 0.0) ? qMin(w, h) / qMax(w, h) : 1.0;
-            mk.area = CV_PI * (w * 0.5) * (h * 0.5);
+    setBusy(true);
+    statusBar()->showMessage(QStringLiteral("识别所有标记点（含编码片）中…"));
+
+    // 识别输入按已生效的黑白场增强; 未启用时是浅拷贝, 新图时是增强后的新 Mat。
+    // 在主线程算好再交给工作线程, 参数取的是点击这一刻的快照。
+    cv::Mat input = enhanceImageForDetect(m_srcMat);
+    m_thread = QThread::create([this, input]() mutable {
+        std::vector<DetectionResult> coded, markers;
+        try {
+            coded = m_detector.detectTarget(input);
+            markers = m_detector.detectMarkers(input);
         }
-        else {
-            mk.major = qMax((double)r.radius, 1.0);
-            mk.aspect = 1.0;
-            mk.area = CV_PI * mk.major * mk.major;
+        catch (const std::exception& e) {
+            const QString msg = QString::fromLocal8Bit(e.what());
+            QMetaObject::invokeMethod(this, [this, msg]() {
+                setBusy(false);
+                statusBar()->showMessage(QStringLiteral("识别失败"));
+                QMessageBox::warning(this, QStringLiteral("识别失败"), msg);
+            }, Qt::QueuedConnection);
+            return;
         }
+        QMetaObject::invokeMethod(this,
+            [this, coded, markers]() { finishDetectAll(coded, markers); },
+            Qt::QueuedConnection);
+    });
+    connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
+    m_thread->start();
+}
 
-        // 优先画亚像素椭圆, 退化时按圆。
-        mk.contour = new QGraphicsPathItem();
-        if (r.hasEllipse)
-            mk.contour->setPath(contourPath(r.ellipse));
-        else
-            mk.contour->setPath(contourPath(r.center, qMax((double)r.radius, 1.0)));
-        m_scene->addItem(mk.contour);
-        mk.contour->setZValue(2);
+// 编码片结果落盘: 旧编码片整类替换; 旧标记点只保留不在新编码片区域内的。
+void testDetect::finishCodedDetect(const std::vector<DetectionResult>& results)
+{
+    // 区域用原始识别结果(不去黑名单): 某一行随后被手动删掉, 它的 4.2R 区域仍然有效。
+    m_codedRegions = results;
 
-        // 中心小点, 不遮挡轮廓。
-        mk.dot = m_scene->addEllipse(mk.pos.x() - m_markRadius * 0.3,
-            mk.pos.y() - m_markRadius * 0.3, m_markRadius * 0.6, m_markRadius * 0.6);
-        mk.dot->setZValue(3);
+    clearUndoStack();
 
-        mk.label = new QGraphicsTextItem();
-        // 忽略视图变换: 标签保持固定屏幕字号, 放大时不遮挡轮廓。
-        mk.label->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
-        mk.label->setHtml(idLabelHtml(mk.id, false, m_labelFontPx, mk.isMarker));
-        mk.label->setPos(mk.pos);   // HTML 的 <br> 让文字落在锚点下方
-        m_scene->addItem(mk.label);
-        mk.label->setZValue(3);
+    QVector<Marker> keptMarkers;
+    for (const Marker& mk : m_markers) {
+        if (mk.isMarker && !isInCodedRegion(mk.pos)) {
+            keptMarkers.push_back(mk);   // 区域外的标记点保留, 图元留在 scene 里
+            continue;
+        }
+        // 旧编码片 / 被编码片取代的标记点: 销毁图元(析构时自动从 scene 摘除)。
+        delete mk.contour;
+        delete mk.dot;
+        delete mk.label;
+    }
+    m_markers.clear();
 
+    for (const DetectionResult& r : results) {
+        if (isResultAreaFiltered(resultArea(r)))   // 面积窗口外的干扰: 进列表前就丢掉
+            continue;
+        const QPointF p(r.center.x, r.center.y);
+        if (isDeletedPoint(p, false))   // 手动删掉的编码片不再加回
+            continue;
+        m_markers.push_back(createMarker(r, false));
+    }
+    // 编码片排在前面, 标记点排在后面。
+    for (const Marker& mk : keptMarkers)
         m_markers.push_back(mk);
 
-        // 坐标保留 3 位小数(亚像素结果, 不能取整)。
-        // RMS 是拟合残差, 用于相对比较, 不是标定精度; 非亚像素结果明确标注。
-        QString text = (m_markerMode
-            ? QStringLiteral("  M%1   (%2, %3)   ")
-            : QStringLiteral("  ID: %1   (%2, %3)   "))
-            .arg(mk.id)
-            .arg(mk.pos.x(), 0, 'f', 3)
-            .arg(mk.pos.y(), 0, 'f', 3);
-        // 面积紧跟坐标: 列表宽度有限, 放在质量信息后面容易被省略号截掉。
-        text += QStringLiteral("面积 %1平方像素   ").arg(mk.area, 0, 'f', 1);
-        if (r.subpixel)
-            text += QStringLiteral("±%1px / %2pt").arg(r.rms, 0, 'f', 3).arg(r.nPoints);
-        else
-            text += QStringLiteral("(!)非亚像素");
+    finalizeResultMerge();
+}
 
+// 标记点结果落盘: 已识别的编码片原样保留; 旧标记点整类替换。
+void testDetect::finishMarkerDetect(const std::vector<DetectionResult>& results)
+{
+    clearUndoStack();
+
+    QVector<Marker> keptCoded;
+    for (const Marker& mk : m_markers) {
+        if (!mk.isMarker) {
+            keptCoded.push_back(mk);
+            continue;
+        }
+        delete mk.contour;
+        delete mk.dot;
+        delete mk.label;
+    }
+    m_markers.clear();
+
+    for (const Marker& mk : keptCoded)
+        m_markers.push_back(mk);
+
+    for (const DetectionResult& r : results) {
+        if (isResultAreaFiltered(resultArea(r)))   // 面积窗口外的干扰: 进列表前就丢掉
+            continue;
+        const QPointF p(r.center.x, r.center.y);
+        if (isInCodedRegion(p))          // 编码片优先: 区域内的标记点不显示
+            continue;
+        if (isDeletedPoint(p, true))     // 手动删掉的干扰点不再加回
+            continue;
+        m_markers.push_back(createMarker(r, true));
+    }
+
+    finalizeResultMerge();
+}
+
+// 一次识别两类: 两类都整类替换。
+void testDetect::finishDetectAll(const std::vector<DetectionResult>& coded,
+                                 const std::vector<DetectionResult>& markers)
+{
+    m_codedRegions = coded;
+
+    clearUndoStack();
+
+    for (const Marker& mk : m_markers) {
+        delete mk.contour;
+        delete mk.dot;
+        delete mk.label;
+    }
+    m_markers.clear();
+
+    for (const DetectionResult& r : coded) {
+        if (isResultAreaFiltered(resultArea(r)))
+            continue;
+        const QPointF p(r.center.x, r.center.y);
+        if (isDeletedPoint(p, false))
+            continue;
+        m_markers.push_back(createMarker(r, false));
+    }
+    for (const DetectionResult& r : markers) {
+        if (isResultAreaFiltered(resultArea(r)))
+            continue;
+        const QPointF p(r.center.x, r.center.y);
+        if (isInCodedRegion(p) || isDeletedPoint(p, true))
+            continue;
+        m_markers.push_back(createMarker(r, true));
+    }
+
+    finalizeResultMerge();
+}
+
+// 从一条识别结果建图元。标记点的 id 先置 0, 编号在 finalizeResultMerge 里生成。
+testDetect::Marker testDetect::createMarker(const DetectionResult& r, bool isMarker)
+{
+    Marker mk;
+    mk.id = isMarker ? 0 : r.id;
+    mk.isMarker = isMarker;
+    mk.pos = QPointF(r.center.x, r.center.y);
+    mk.subpixel = r.subpixel;
+    mk.rms = r.rms;
+    mk.nPoints = r.nPoints;
+    // 几何描述取实际绘制的轮廓: 有拟合椭圆用椭圆, 否则用圆。
+    if (r.hasEllipse && r.ellipse.size.width > 0 && r.ellipse.size.height > 0) {
+        const double w = r.ellipse.size.width;
+        const double h = r.ellipse.size.height;
+        mk.major = qMax(w, h) * 0.5;
+        mk.aspect = (mk.major > 0.0) ? qMin(w, h) / qMax(w, h) : 1.0;
+    }
+    else {
+        mk.major = qMax((double)r.radius, 1.0);
+        mk.aspect = 1.0;
+    }
+    mk.area = resultArea(r);
+
+    // 优先画亚像素椭圆, 退化时按圆。
+    mk.contour = new QGraphicsPathItem();
+    if (r.hasEllipse)
+        mk.contour->setPath(contourPath(r.ellipse));
+    else
+        mk.contour->setPath(contourPath(r.center, qMax((double)r.radius, 1.0)));
+    m_scene->addItem(mk.contour);
+    mk.contour->setZValue(2);
+
+    // 中心小点, 不遮挡轮廓。
+    mk.dot = m_scene->addEllipse(mk.pos.x() - m_markRadius * 0.3,
+        mk.pos.y() - m_markRadius * 0.3, m_markRadius * 0.6, m_markRadius * 0.6);
+    mk.dot->setZValue(3);
+
+    mk.label = new QGraphicsTextItem();
+    // 忽略视图变换: 标签保持固定屏幕字号, 放大时不遮挡轮廓。
+    mk.label->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+    mk.label->setHtml(idLabelHtml(mk.id, false, m_labelFontPx, mk.isMarker));
+    mk.label->setPos(mk.pos);   // HTML 的 <br> 让文字落在锚点下方
+    m_scene->addItem(mk.label);
+    mk.label->setZValue(3);
+
+    return mk;
+}
+
+// 合并完成后的统一收尾: 重排标记点编号 -> 重建列表行 -> 刷新统计。
+void testDetect::finalizeResultMerge()
+{
+    // 标记点按最终列表顺序从 1 连续编号; 编码片保留自己的 ID。
+    int seq = 0;
+    for (Marker& mk : m_markers) {
+        if (mk.isMarker)
+            mk.id = ++seq;
+        if (mk.label)
+            mk.label->setHtml(idLabelHtml(mk.id, false, m_labelFontPx, mk.isMarker));
+    }
+
+    // 结果整体重排后, 旧的勾选/ROI 已经没有意义。
+    m_roiPolygon = QPolygonF();
+    m_roiIds.clear();
+    if (m_roiItem) {
+        m_roiItem->setPolygon(QPolygonF());
+        m_roiItem->setVisible(false);
+    }
+
+    m_updatingList = true;
+    m_list->clear();
+    m_pressedItem = nullptr;          // 列表项已销毁, 不能再留按下记录
+    for (int i = 0; i < m_markers.size(); ++i) {
+        const Marker& mk = m_markers[i];
+        const QString text = markerRowText(mk);
         QListWidgetItem* item = new QListWidgetItem(text, m_list);
         item->setToolTip(text);             // 列宽不足被省略时, 悬停可看全
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
         item->setCheckState(Qt::Unchecked);
-        item->setData(Qt::UserRole, (int)i);        // 关联 m_markers 下标
-        if (!r.subpixel)
+        item->setData(Qt::UserRole, i);     // 行号 == m_markers 下标
+        if (!mk.subpixel)
             item->setForeground(QBrush(QColor(255, 170, 60)));   // 非亚像素: 橙色提醒
     }
     m_updatingList = false;
 
     updateResultTitle();
     updateResultButtons();
-
-    applyHighlights();
+    applyHighlights();      // 同时把结果统计写进状态栏
+    // 识别跑完但一个结果都没有时, updateRoiStatus 会回落到"点识别按钮"的提示;
+    // 这里覆盖成明确的"未识别到", 让用户分得清"还没识别"和"识别了但没结果"。
+    if (m_markers.isEmpty())
+        statusBar()->showMessage(resultSummary());
     setBusy(false);
+}
 
-    const QString what = m_markerMode ? QStringLiteral("标记点") : QStringLiteral("编码点");
-    if (results.empty()) {
-        statusBar()->showMessage(QStringLiteral("未识别到%1").arg(what));
+// 结果列表的一行文字。坐标保留 3 位小数(亚像素结果, 不能取整)。
+// RMS 是拟合残差, 用于相对比较, 不是标定精度; 非亚像素结果明确标注。
+QString testDetect::markerRowText(const Marker& mk)
+{
+    QString text = (mk.isMarker
+        ? QStringLiteral("  M%1   (%2, %3)   ")
+        : QStringLiteral("  ID: %1   (%2, %3)   "))
+        .arg(mk.id)
+        .arg(mk.pos.x(), 0, 'f', 3)
+        .arg(mk.pos.y(), 0, 'f', 3);
+    // 面积紧跟坐标: 列表宽度有限, 放在质量信息后面容易被省略号截掉。
+    text += QStringLiteral("面积 %1平方像素   ").arg(mk.area, 0, 'f', 1);
+    if (mk.subpixel)
+        text += QStringLiteral("±%1px / %2pt").arg(mk.rms, 0, 'f', 3).arg(mk.nPoints);
+    else
+        text += QStringLiteral("(!)非亚像素");
+    return text;
+}
+
+// 状态栏统计: 单一类型只显示该类型, 混合时两类都显示。
+QString testDetect::resultSummary() const
+{
+    if (m_markers.isEmpty())
+        return QStringLiteral("未识别到任何结果");
+
+    int nCoded = 0, nMark = 0, nSub = 0;
+    double rmsSum = 0.0, rmsMax = 0.0;
+    for (const Marker& mk : m_markers) {
+        if (mk.isMarker) ++nMark; else ++nCoded;
+        if (!mk.subpixel) continue;
+        ++nSub;
+        rmsSum += mk.rms;
+        rmsMax = qMax(rmsMax, (double)mk.rms);
     }
-    else {
-        int nSub = 0;
-        double rmsSum = 0.0, rmsMax = 0.0;
-        for (const DetectionResult& r : results) {
-            if (!r.subpixel) continue;
-            ++nSub;
-            rmsSum += r.rms;
-            rmsMax = qMax(rmsMax, (double)r.rms);
+
+    QString s;
+    if (nCoded > 0 && nMark > 0)
+        s = QStringLiteral("编码片 %1 个，标记点 %2 个").arg(nCoded).arg(nMark);
+    else if (nCoded > 0)
+        s = QStringLiteral("编码片 %1 个").arg(nCoded);
+    else
+        s = QStringLiteral("标记点 %1 个").arg(nMark);
+
+    s += QStringLiteral("  |  亚像素 %1 个").arg(nSub);
+    if (nSub > 0)
+        s += QStringLiteral("  残差 RMS 均值 %1px / 最大 %2px")
+            .arg(rmsSum / nSub, 0, 'f', 3).arg(rmsMax, 0, 'f', 3);
+    if (nSub < m_markers.size())
+        s += QStringLiteral("  (!) %1 个退回整数轮廓, 见橙虚线").arg(m_markers.size() - nSub);
+    return s;
+}
+
+// 面积窗口: 小于下限或大于上限都算被过滤。上限 0 = 不设上限(不是"全删")。
+bool testDetect::isResultAreaFiltered(double area) const
+{
+    if (area < (double)m_host.minResultArea)
+        return true;
+    if (m_host.maxResultArea > 0 && area > (double)m_host.maxResultArea)
+        return true;
+    return false;
+}
+
+// 编码片区域: 最近一次编码片识别的原始结果(含已被手动删掉的行), 按 4.2R 放宽。
+bool testDetect::isInCodedRegion(const QPointF& pos) const
+{
+    for (const DetectionResult& r : m_codedRegions) {
+        if (r.hasEllipse && r.ellipse.size.width > 0 && r.ellipse.size.height > 0) {
+            if (pointInScaledEllipse(r.ellipse, kCodedRegionScale, pos))
+                return true;
         }
-        QString msg = QStringLiteral("识别到 %1 个%2  |  亚像素 %3 个")
-            .arg(results.size()).arg(what).arg(nSub);
-        if (nSub > 0)
-            msg += QStringLiteral("  残差 RMS 均值 %1px / 最大 %2px")
-                .arg(rmsSum / nSub, 0, 'f', 3).arg(rmsMax, 0, 'f', 3);
-        if (nSub < (int)results.size())
-            msg += QStringLiteral("  (!) %1 个退回整数轮廓, 见橙虚线")
-                .arg((int)results.size() - nSub);
-        statusBar()->showMessage(msg);
+        else {
+            const double rr = qMax((double)r.radius, 1.0) * kCodedRegionScale;
+            if (dist2(pos, QPointF(r.center.x, r.center.y)) <= rr * rr)
+                return true;
+        }
+    }
+    return false;
+}
+
+bool testDetect::isDeletedPoint(const QPointF& pos, bool isMarker) const
+{
+    const double tol2 = kDeletedPointTol * kDeletedPointTol;
+    for (const DeletedPoint& d : m_deletedPoints) {
+        if (d.isMarker == isMarker && dist2(d.pos, pos) <= tol2)
+            return true;
+    }
+    return false;
+}
+
+void testDetect::rememberDeletedPoint(const QPointF& pos, bool isMarker)
+{
+    if (isDeletedPoint(pos, isMarker))
+        return;
+    DeletedPoint d;
+    d.pos = pos;
+    d.isMarker = isMarker;
+    m_deletedPoints.push_back(d);
+}
+
+void testDetect::forgetDeletedPoint(const QPointF& pos, bool isMarker)
+{
+    const double tol2 = kDeletedPointTol * kDeletedPointTol;
+    for (int i = 0; i < m_deletedPoints.size(); ++i) {
+        if (m_deletedPoints[i].isMarker == isMarker
+            && dist2(m_deletedPoints[i].pos, pos) <= tol2) {
+            m_deletedPoints.remove(i);
+            return;
+        }
     }
 }
 
@@ -1834,9 +2392,19 @@ void testDetect::updateResultTitle()
 {
     if (!m_listTitle)
         return;
-    m_listTitle->setText((m_markerMode ? QStringLiteral("标记点结果 (%1)")
-                                       : QStringLiteral("识别结果 (%1)"))
-                             .arg(m_markers.size()));
+    int nCoded = 0, nMark = 0;
+    for (const Marker& mk : m_markers) {
+        if (mk.isMarker) ++nMark; else ++nCoded;
+    }
+    if (nCoded > 0 && nMark > 0)
+        m_listTitle->setText(QStringLiteral("识别结果 (编码片 %1 · 标记点 %2)")
+            .arg(nCoded).arg(nMark));
+    else if (nCoded > 0)
+        m_listTitle->setText(QStringLiteral("识别结果 (编码片 %1)").arg(nCoded));
+    else if (nMark > 0)
+        m_listTitle->setText(QStringLiteral("标记点结果 (%1)").arg(nMark));
+    else
+        m_listTitle->setText(QStringLiteral("识别结果"));
 }
 
 // 行号与 m_markers 下标一一对应。从大到小删除, 前面行的下标不会失效。
@@ -1860,6 +2428,9 @@ int testDetect::removeMarkerRows(QVector<int> rows)
         rec.index = row;
         rec.marker = m_markers[row];
         rec.item = m_list->takeItem(row);
+
+        // 记住删除位置: 再点一次同类识别时, 坐标相差 ≤5px 的结果不再加回。
+        rememberDeletedPoint(rec.marker.pos, rec.marker.isMarker);
 
         // 摘除但不销毁: 撤销时 addItem 原样加回。
         if (rec.marker.contour)
@@ -1951,6 +2522,8 @@ void testDetect::onUndo()
             m_scene->addItem(rec.marker.dot);
         if (rec.marker.label)
             m_scene->addItem(rec.marker.label);
+        // 撤销删除 = 这个点重新算数, 从黑名单里拿掉, 否则重新识别时它反而不会回来。
+        forgetDeletedPoint(rec.marker.pos, rec.marker.isMarker);
     }
     for (int r = 0; r < m_list->count(); ++r)
         m_list->item(r)->setData(Qt::UserRole, r);
@@ -2053,7 +2626,7 @@ void testDetect::onRemoveNoise()
 
     QLabel* tip = new QLabel(QStringLiteral(
         "选择一个识别正确、有代表性的结果作为模板。\n"
-        "轮廓面积和长短轴比都与模板接近的结果保留，相差较大的删除。"), &dlg);
+        "轮廓面积与模板接近的结果保留，相差较大的删除（只看面积，不再看长短轴比）。"), &dlg);
     tip->setWordWrap(true);
     lay->addWidget(tip);
 
@@ -2063,15 +2636,14 @@ void testDetect::onRemoveNoise()
     combo->setMinimumContentsLength(24);
     for (int i = 0; i < m_markers.size(); ++i) {
         const Marker& mk = m_markers[i];
-        const QString head = m_markerMode
+        const QString head = mk.isMarker
             ? QStringLiteral("M%1").arg(mk.id)
             : QStringLiteral("ID:%1").arg(mk.id);
-        combo->addItem(QStringLiteral("%1   (%2, %3)   面积 %4   长短轴比 %5")
+        combo->addItem(QStringLiteral("%1   (%2, %3)   面积 %4")
             .arg(head)
             .arg(mk.pos.x(), 0, 'f', 3)
             .arg(mk.pos.y(), 0, 'f', 3)
-            .arg(mk.area, 0, 'f', 1)
-            .arg(mk.aspect, 0, 'f', 2));
+            .arg(mk.area, 0, 'f', 1));
     }
     lay->addWidget(combo);
 
@@ -2101,7 +2673,8 @@ void testDetect::onRemoveNoise()
     connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
 
-    // 面积与长短轴比都允许相对模板 ±t 的偏差, 两项都在范围内才保留。
+    // 只按轮廓面积筛: 面积在模板 ±t 范围内才保留。
+    // (倾斜/椭圆度不再参与判定 —— 形状差异交由长短轴相关参数和人工判断。)
     auto collectKill = [this, combo, tol]() -> QVector<int> {
         const int ti = combo->currentIndex();
         if (ti < 0 || ti >= m_markers.size())
@@ -2117,8 +2690,7 @@ void testDetect::onRemoveNoise()
         for (int i = 0; i < m_markers.size(); ++i) {
             if (i == ti)
                 continue;
-            const Marker& mk = m_markers[i];
-            if (!close(mk.area, tpl.area) || !close(mk.aspect, tpl.aspect))
+            if (!close(m_markers[i].area, tpl.area))
                 kill.push_back(i);
         }
         return kill;
@@ -2131,10 +2703,9 @@ void testDetect::onRemoveNoise()
         const Marker& tpl = m_markers[ti];
         const QVector<int> kill = collectKill();
         preview->setText(QStringLiteral(
-            "模板：面积 %1，长短轴比 %2，允许偏差 ±%3%\n"
-            "保留 %4 个，删除 %5 个")
+            "模板：面积 %1，允许偏差 ±%2%\n"
+            "保留 %3 个，删除 %4 个")
             .arg(tpl.area, 0, 'f', 1)
-            .arg(tpl.aspect, 0, 'f', 2)
             .arg(tol->value(), 0, 'f', 0)
             .arg(m_markers.size() - kill.size())
             .arg(kill.size()));
@@ -2220,14 +2791,23 @@ void testDetect::applyHighlights()
         // 勾选即高亮, 不要求先进入画框模式。
         const bool on = (item->checkState() == Qt::Checked);
 
-        // 轮廓配色: 选中红色粗线 / 正常青绿 / 非亚像素橙色虚线。
+        // 轮廓配色: 选中红色 / 正常青绿 / 非亚像素橙色虚线。
+        // 用 cosmetic 画笔: 线宽是屏幕像素, 不随视图缩放变粗 —— 放大看轮廓包络时
+        // 不会被一条几像素宽的线盖住真实边缘。
+        auto screenPen = [](const QColor& c, qreal w, Qt::PenStyle style = Qt::SolidLine) {
+            QPen p(c);
+            p.setWidthF(w);
+            p.setCosmetic(true);
+            p.setStyle(style);
+            return p;
+        };
         QPen contourPen;
         if (on)
-            contourPen = QPen(QColor(255, 60, 60), m_penW * 2.2);
+            contourPen = screenPen(QColor(255, 60, 60), 2.0);
         else if (mk.subpixel)
-            contourPen = QPen(QColor(0, 255, 170), m_penW * 1.3);
+            contourPen = screenPen(QColor(0, 255, 170), 1.0);
         else
-            contourPen = QPen(QColor(255, 170, 60), m_penW * 1.3, Qt::DashLine);
+            contourPen = screenPen(QColor(255, 170, 60), 1.0, Qt::DashLine);
         mk.contour->setPen(contourPen);
 
         const double r = m_markRadius * (on ? 0.5 : 0.3);
@@ -2284,14 +2864,13 @@ void testDetect::updateRoiStatus()
 {
     const int n = m_roiIds.size();
     if (n == 0) {
-        if (m_markers.isEmpty())
-            statusBar()->showMessage(m_hasImage
-                ? QStringLiteral("点「开始识别编码片」或「识别标记点」运行检测")
-                : QStringLiteral("请先导入图片"));
+        if (!m_hasImage)
+            statusBar()->showMessage(QStringLiteral("请先导入图片"));
+        else if (m_markers.isEmpty())
+            statusBar()->showMessage(QStringLiteral(
+                "点「开始识别编码片」、「识别标记点」或「识别所有标记点」运行检测"));
         else
-            statusBar()->showMessage(QStringLiteral("识别到 %1 个%2")
-                .arg(m_markers.size())
-                .arg(m_markerMode ? QStringLiteral("标记点") : QStringLiteral("编码点")));
+            statusBar()->showMessage(resultSummary());
         return;
     }
 
@@ -2382,6 +2961,10 @@ bool testDetect::eventFilter(QObject* watched, QEvent* event)
 
 void testDetect::clearResults()
 {
+    // 换图/换相机参数后坐标与目标都变了, 删除黑名单和编码片区域一并作废。
+    m_deletedPoints.clear();
+    m_codedRegions.clear();
+
     clearUndoStack();
     for (const Marker& mk : m_markers) {
         delete mk.contour;  // 析构时自动从 scene 摘除
@@ -2393,6 +2976,7 @@ void testDetect::clearResults()
     m_updatingList = true;
     m_list->clear();
     m_updatingList = false;
+    m_pressedItem = nullptr;      // 列表项已销毁, 不能再留按下记录
 
     m_roiPolygon = QPolygonF();
     m_roiIds.clear();
@@ -2412,6 +2996,7 @@ void testDetect::setBusy(bool busy)
     m_btnCamera->setEnabled(!busy);
     m_btnDetect->setEnabled(!busy && m_hasImage);
     m_btnDetectMarkers->setEnabled(!busy && m_hasImage);
+    m_btnDetectAll->setEnabled(!busy && m_hasImage);
     m_btnFit->setEnabled(!busy);
     updateResultButtons();
     // 识别期间禁用整栏: 参数本身有快照保护, 但禁掉可避免"本次用的哪套参数"说不清。
