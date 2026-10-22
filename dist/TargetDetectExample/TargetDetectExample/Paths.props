@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  第三方依赖路径配置。
+
+  只需要改这两个变量：
+    QtDir      Qt 5.14.2 MSVC2017 x64 的安装根目录（里面有 include\ 和 lib\）
+    OpenCvDir  OpenCV 4.3.0 的 build 目录（里面有 include\ 和 x64\vc15\lib\）
+
+  优先级（从高到低）：
+    1. 在 VS 的“属性管理器”或本文件里直接改 <QtDir>/<OpenCvDir> 的值；
+    2. 环境变量 QTDIR / OpenCV_DIR；
+    3. 下面写的默认路径。
+-->
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup Label="UserMacros">
+    <!-- ===== 改这里 =====
+         Qt 常见两种安装布局，按你机器上的实际路径填：
+           C:\Qt\5.14.2\msvc2017_64
+           C:\Qt\Qt5.14.2\5.14.2\msvc2017_64
+    -->
+   
+    <QtDir Condition="'$(QtDir)'==''">D:\1yjy\software\qt\Qt5.14.2\5.14.2\msvc2017_64</QtDir>
+
+    <OpenCvDir Condition="'$(OpenCvDir)'==''">D:\1yjy\software\opencv\build</OpenCvDir>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- 本示例的根目录：...\TargetDetectExample\ -->
+    <SdkDir>$(MSBuildThisFileDirectory)..</SdkDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!--
+        TargetDetector.h 需要 OpenCV 和 Qt Core 的头文件：
+          <QObject> 在 $(QtDir)\include\QtCore 下
+          <opencv2/opencv.hpp> 在 $(OpenCvDir)\include 下
+      -->
+      <AdditionalIncludeDirectories>$(SdkDir)\include;$(QtDir)\include;$(QtDir)\include\QtCore;$(OpenCvDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+
+    <Link>
+      <AdditionalLibraryDirectories>$(SdkDir)\lib;$(QtDir)\lib;$(OpenCvDir)\x64\vc15\lib;$(OpenCvDir)\x64\vc14\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <!--
+        schneider0807.lib  靶标识别导入库（随附在 lib\ 下）
+        opencv_world430.lib OpenCV 4.3.0 Release 导入库
+        Qt5Core.lib         DLL 依赖 Qt5Core.dll（示例本身只用 C++ 标准库）
+      -->
+      <AdditionalDependencies>schneider0807.lib;opencv_world430.lib;Qt5Core.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+</Project>

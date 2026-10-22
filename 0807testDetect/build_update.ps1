@@ -57,6 +57,7 @@ $targets = @(
                   (Join-Path $root '0807testDetect\testDetect.qrc'),
                   (Join-Path $root '0807testDetect\theme.qss'),
                   (Join-Path $root '0807testDetect\include\TargetDetector.h'),
+                  (Join-Path $root '0807testDetect\include\TargetDetectorParams.h'),
                   # 这三份 .vcxproj / .props 改了也属于"宿主需要重编"
                   (Join-Path $root '0807testDetect\0807testDetect.vcxproj'))
         Note  = '宿主界面/参数栏'
@@ -65,7 +66,8 @@ $targets = @(
         Name  = 'schneider0807.dll'
         Prod  = Join-Path $schRoot 'x64\Release\schneider0807.dll'
         Src   = @((Join-Path $schRoot 'schneider0807\TargetDetector.cpp'),
-                  (Join-Path $schRoot 'schneider0807\TargetDetector.h'))
+                  (Join-Path $schRoot 'schneider0807\TargetDetector.h'),
+                  (Join-Path $schRoot 'schneider0807\TargetDetectorParams.h'))
         Note  = '靶标识别算法'
     }
     [pscustomobject]@{
@@ -87,19 +89,32 @@ Write-Host "== 打包增量更新 ==" -ForegroundColor Cyan
 # 宿主按值持有 TargetDetector(m_detector), 它的成员布局必须和 DLL 里的一致。改了一份没同步
 # 另一份, 两边就会按不同的偏移读写同一个对象 —— 那是**写坏内存**, 不报错、只是偶尔崩或算出怪结果。
 # 这是排查代价最高的一类故障, 所以打包前直接比对文件内容拦下来。
-$hHost = Join-Path $root '0807testDetect\include\TargetDetector.h'
-$hDll  = Join-Path $schRoot 'schneider0807\TargetDetector.h'
-if (-not (Test-Path -LiteralPath $hHost) -or -not (Test-Path -LiteralPath $hDll)) {
-    throw "找不到 TargetDetector.h 的两份副本:`n  $hHost`n  $hDll"
+$headerPairs = @(
+    [pscustomobject]@{
+        Name = 'TargetDetector.h'
+        Host = Join-Path $root '0807testDetect\include\TargetDetector.h'
+        Dll  = Join-Path $schRoot 'schneider0807\TargetDetector.h'
+    }
+    [pscustomobject]@{
+        # 上位机定义了 TD_OWNER，会编译进完整的 DetectorParams；两边布局也必须一致
+        Name = 'TargetDetectorParams.h'
+        Host = Join-Path $root '0807testDetect\include\TargetDetectorParams.h'
+        Dll  = Join-Path $schRoot 'schneider0807\TargetDetectorParams.h'
+    }
+)
+foreach ($h in $headerPairs) {
+    if (-not (Test-Path -LiteralPath $h.Host) -or -not (Test-Path -LiteralPath $h.Dll)) {
+        throw "找不到 $($h.Name) 的两份副本:`n  $($h.Host)`n  $($h.Dll)"
+    }
+    if ((Get-FileHash -LiteralPath $h.Host).Hash -ne (Get-FileHash -LiteralPath $h.Dll).Hash) {
+        Write-Host "!! 两份 $($h.Name) 内容不一致, 绝不要这样发出去:" -ForegroundColor Red
+        Write-Host "     宿主: $($h.Host)" -ForegroundColor Red
+        Write-Host "     DLL : $($h.Dll)" -ForegroundColor Red
+        Write-Host "   宿主按值持有 TargetDetector, 两边布局必须一致; 请把改动同步到另一份并重编两者。" -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host "  两份 $($h.Name) 一致" -ForegroundColor Green
 }
-if ((Get-FileHash -LiteralPath $hHost).Hash -ne (Get-FileHash -LiteralPath $hDll).Hash) {
-    Write-Host "!! 两份 TargetDetector.h 内容不一致, 绝不要这样发出去:" -ForegroundColor Red
-    Write-Host "     宿主: $hHost" -ForegroundColor Red
-    Write-Host "     DLL : $hDll" -ForegroundColor Red
-    Write-Host "   宿主按值持有 TargetDetector, 两边布局必须一致; 请把改动同步到另一份并重编两者。" -ForegroundColor Yellow
-    exit 1
-}
-Write-Host "  两份 TargetDetector.h 一致" -ForegroundColor Green
 
 # ---- 1) 产物是否齐全 ------------------------------------------------------
 foreach ($t in $targets) {

@@ -184,10 +184,15 @@ repo root; the in-app tooltips carry the same conclusions in condensed form.
   overlays and the list are untouched. The operation is pointwise, so the coordinate frame is
   unchanged. Off by default (`enhanceEnable=false`); black 0 + white 255 is identity. Persisted as
   `enhanceEnable` / `enhanceBlack` / `enhanceWhite` in `[detectParams]` (`writeHostParams` /
-  `readHostParams`), and **not** stored in `DetectorParams` for the by-value-layout reason below.
-- **结果过滤 · 最小/最大面积(px²)** is deliberately **not** in `DetectorParams`: that struct is
-  embedded by value in `TargetDetector`, so adding a field would force a synchronized rebuild of both
-  headers, `schneider0807.lib` and `.dll`. The window (`m_minResultArea`, default 100;
+  `readHostParams`), and **not** stored in `DetectorParams` for the host UI. The customer-facing
+  `DetectOptions` now also carries these three fields plus `grayscale`; the new DLL methods apply
+  them internally (see the "客户接口" note under the header-sync section).
+- **结果过滤 · 最小/最大面积(px²)** is deliberately **not** in `DetectorParams`: it is a host-side
+  window for the upper-computer UI. The customer-facing `DetectOptions` carries `minResultArea` /
+  `maxResultArea`, and the new DLL methods apply them. `DetectorParams` is now held by
+  `std::unique_ptr` (so the customer header can forward-declare it), but adding a field still means
+  rebuilding `schneider0807.lib` / `.dll` and the host with the synchronized headers. The host
+  window (`m_minResultArea`, default 100;
   `m_maxResultArea`, default 10000; 0 = that side is off) lives in the host and is applied in
   `finishCodedDetect` / `finishMarkerDetect` / `finishDetectAll` through `isResultAreaFiltered(resultArea(r))`
   (the same area shown in the list/export) **before** a `Marker` is created. Small noise circles
@@ -248,21 +253,42 @@ repo root; the in-app tooltips carry the same conclusions in condensed form.
   lives inside `tabDetect`'s toolbar, and `onCameraParams()` also guards `m_tabs->currentIndex() == 0`.
   See `参数说明.md` §14.
 
-#### ⚠ `TargetDetector.h` exists twice and the two copies must stay identical
+#### ⚠ `TargetDetector.h` / `TargetDetectorParams.h` copies must stay identical
 
-`schneider0807/schneider0807/TargetDetector.h` and `0807testDetect/0807testDetect/include/TargetDetector.h`
-are independent copies (`diff` must be empty). The host holds `TargetDetector` **by value** (`m_detector`),
-so its `sizeof` has to match the DLL's: changing one copy means the two sides disagree about the layout
-of the same object and memory gets corrupted. Any change to the exported interface must update, in one
-batch: both `.h`, `schneider0807.lib`, `schneider0807.dll`. Build order is DLL first, then the host:
+There are now **two interface headers** and several copies:
+
+| 文件 | DLL | 上位机 | 客户示例 | 说明 |
+| --- | --- | --- | --- | --- |
+| `TargetDetector.h` | `schneider0807/schneider0807/` | `0807testDetect/0807testDetect/include/` | `TargetDetectExample/include/` | 三份必须逐字节一致 |
+| `TargetDetectorParams.h` | `schneider0807/schneider0807/` | `0807testDetect/0807testDetect/include/` | **不提供** | 上位机/DLL 内部 33 项参数 |
+
+`TargetDetector.h` is the customer-facing header: without `TD_OWNER` it exposes only
+`DetectOptions` (10 params), `detectMarkerPoints` / `detectCodedTargetPoints` /
+`detectAllPoints`, and `filterLowQuality`. With `TD_OWNER` (defined by the DLL project and
+the host project, **not** by the example) it also declares the old host API
+(`detectTarget`, `detectMarkers`, `detectTargets`, `params`/`setParams`, `undistortImage`,
+`setDebugView`) and includes `TargetDetectorParams.h`. The example must be built **without**
+`TD_OWNER`, otherwise it will fail to find `TargetDetectorParams.h`.
+
+The host holds `TargetDetector` **by value** (`m_detector`), so its `sizeof` has to match the DLL's:
+changing one copy means the two sides disagree about the layout of the same object and memory gets
+corrupted. `m_params` is now a `std::unique_ptr<DetectorParams>` so the customer header can
+forward-declare `DetectorParams`; the data-member layout is still identical in both builds. Any change
+to the exported interface must update, in one batch: both `.h` copies of **each** header,
+`schneider0807.lib`, `schneider0807.dll`. Build order is DLL first, then the host, then the example:
 
 ```bash
 MSB="/d/Software/VS2017/MSBuild/15.0/Bin/MSBuild.exe"
 "$MSB" schneider0807/schneider0807.sln   -p:Configuration=Debug -p:Platform=x64 -m
-cp schneider0807/x64/Debug/schneider0807.dll     0807testDetect/x64/Debug/
-cp schneider0807/x64/Debug/schneider0807.lib     0807testDetect/0807testDetect/lib/
-cp schneider0807/schneider0807/TargetDetector.h  0807testDetect/0807testDetect/include/
+cp schneider0807/x64/Debug/schneider0807.dll        0807testDetect/x64/Debug/
+cp schneider0807/x64/Debug/schneider0807.lib        0807testDetect/0807testDetect/lib/
+cp schneider0807/schneider0807/TargetDetector.h     0807testDetect/0807testDetect/include/
+cp schneider0807/schneider0807/TargetDetectorParams.h 0807testDetect/0807testDetect/include/
 "$MSB" 0807testDetect/0807testDetect.sln -p:Configuration=Debug -p:Platform=x64 -m
+# Release 版同样要重编 DLL + 宿主；客户示例用 Release 的 lib/dll/头文件
+cp schneider0807/x64/Release/schneider0807.dll      TargetDetectExample/bin/x64/Release/
+cp schneider0807/x64/Release/schneider0807.lib      TargetDetectExample/lib/
+cp schneider0807/schneider0807/TargetDetector.h     TargetDetectExample/include/
 ```
 
 ⚠ In git-bash, msbuild switches must use the dash form (`-p:Configuration=...`). The `/p:...` form gets

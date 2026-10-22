@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <!--
+      只提供 Release|x64。
+      原因：随附的 schneider0807.dll / opencv_world430.dll 都是 Release 版；
+      Debug 版依赖 MSVCP140D 等不可再分发的调试运行库，而且 Debug/Release 混用
+      会让跨 DLL 返回的 std::vector 布局不一致（静默内存损坏）。
+      确实要调试时，请用 Debug 版 DLL + opencv_world430d.lib 单独建配置。
+    -->
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>15.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{7B8A9F0C-3C2E-4B7A-9D1E-6A5B2C4D8E10}</ProjectGuid>
+    <RootNamespace>TargetDetectExample</RootNamespace>
+    <ProjectName>TargetDetectExample</ProjectName>
+    <!-- 换机器时如果本机没有 10.0.17763.0，在 VS 的项目属性里选一个已安装的 SDK 版本即可 -->
+    <WindowsTargetPlatformVersion>10.0.17763.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v141</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+    <!-- Qt / OpenCV / 随附 lib 的路径都在这里改 -->
+    <Import Project="Paths.props" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <!-- 用 MSBuildThisFileDirectory 而不是 SolutionDir：直接打开 .vcxproj 编译也能输出到同一个 bin -->
+    <OutDir>$(MSBuildThisFileDirectory)..\bin\x64\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\obj\x64\$(Configuration)\</IntDir>
+    <TargetName>TargetDetectExample</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>wyf.h</PrecompiledHeaderFile>
+      <!-- 必须与 Release 版 DLL/OpenCV 一致：/MD（多线程 DLL 运行库） -->
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <LanguageStandard>stdcpp14</LanguageStandard>
+      <!-- 源码是 UTF-8（含中文注释），显式告诉编译器；避免 C4819 -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+    <PostBuildEvent>
+      <!-- 把示例图片和“双击运行”脚本放到 exe 旁边，编译完可以直接 F5/双击运行 -->
+      <Command>if not exist "$(OutDir)images" mkdir "$(OutDir)images"
+xcopy /Y /I /Q "$(SdkDir)\images\sample.png" "$(OutDir)images\"
+if exist "$(MSBuildThisFileDirectory)run_example.bat" xcopy /Y /I /Q "$(MSBuildThisFileDirectory)run_example.bat" "$(OutDir)"</Command>
+      <Message>Copy sample image / run_example.bat to output folder</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="wyf.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="wyf.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Paths.props">
+      <SubType>Designer</SubType>
+    </None>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>
