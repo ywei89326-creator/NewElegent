@@ -353,6 +353,16 @@ These are engineered workarounds with comments explaining them — changing them
 - **`m_updatingList`** guards every programmatic list mutation to suppress `itemChanged` re-entry.
 - **Labels** (`QGraphicsTextItem`) set `ItemIgnoresTransformations` so ID tags stay a fixed screen size at any zoom; entity sizes (`m_penW`) instead scale with image resolution in `showImage()`.
 - **The center dot is a fixed device-pixel point** (`createMarker`/`applyHighlights`): a `QGraphicsEllipseItem` with `ItemIgnoresTransformations`, radius 2 px (2.5 px when checked), positioned at the sub-pixel center. Because it ignores the view transform, zooming to inspect an edge does not blow it up into a blob that hides the very edge being measured. Do **not** go back to sizing it from `m_markRadius` in scene units.
+- **Half-pixel convention — `showImage()` must keep `m_pixmapItem->setOffset(-0.5, -0.5)`.** Qt draws image
+  pixel `(i,j)` into the scene rect `[i,i+1)×[j,j+1)`, so its centre sits at scene `i+0.5`; detection
+  coordinates follow OpenCV, where the centre of pixel `(i,j)` *is* `(i,j)`. Without the offset every
+  overlay (contour, ellipse, centre dot, ROI polygon, ID label) is drawn 0.5 px up-left of the pixels it
+  describes — at high zoom the contour's left edge runs over black background while its right edge never
+  reaches the outermost white pixel, which reads as "the algorithm's centre is biased left". The
+  half-pixel is a *display* artifact only: `contourPoints`, `center` and the exported txt are already
+  correct (verified on an analytically rendered disc: returned centre = ground truth to 1e-4). Because of
+  the offset, `updatePixelInfo()` maps scene→pixel with `floor(s + 0.5)`, not `floor(s)`. Both halves of
+  this must change together.
 - **Marker contour pens are cosmetic** (`applyHighlights`): 1 device px for a normal subpixel result, 1 px dashed orange for non-subpixel, 2 px red when checked. A cosmetic pen ignores the view transform, so zooming in does not thicken the outline over the very edge the user is inspecting. The contour path is either a fitted ellipse or a free-form `smoothClosedPath(r.contourPoints)`; both are just `QGraphicsPathItem` paths, so the pen logic is unchanged.
 - **`m_autoFit`** goes false as soon as the user zooms manually, so a window resize stops snapping back to fit. `eventFilter`'s `Resize` branch must null-check `m_pixmapItem`: `QGraphicsView::fitInView(const QGraphicsItem*, ...)` does not, and dereferences it (crash on startup).
 - Zoom uses `pow(1.0015, delta)` with a clamped range so in/out are exact inverses; the wheel event is consumed so the view doesn't scroll.

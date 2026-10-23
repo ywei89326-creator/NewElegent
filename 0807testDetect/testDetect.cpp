@@ -2245,6 +2245,13 @@ void testDetect::showImage(const cv::Mat& bgr)
     const QImage img(rgb.data, rgb.cols, rgb.rows, (int)rgb.step, QImage::Format_RGB888);
     m_pixmapItem = m_scene->addPixmap(QPixmap::fromImage(img.copy()));
     m_pixmapItem->setZValue(0);
+    // ⚠ 半像素约定: QGraphicsPixmapItem 把图像像素 (i,j) 画在场景矩形 [i,i+1)×[j,j+1) 里,
+    // 像素中心落在场景 i+0.5; 而识别结果的坐标是 OpenCV 口径 —— 像素 (i,j) 的中心
+    // 就是整数坐标 (i,j)。两边差半个像素, 不抵消的话所有叠加图元(亚像素轮廓/拟合椭圆/
+    // 中心点/ROI 多边形/标签)都会整体偏左上 0.5px: 左边压到黑底上、右边到不了最外圈白像素,
+    // 看起来就像算法把中心算歪了。把底图左上各移半像素, 两套口径才对齐。
+    // 改了这里, updatePixelInfo 的 floor(s+0.5) 必须跟着一起改。
+    m_pixmapItem->setOffset(-0.5, -0.5);
 
     m_scene->setSceneRect(m_pixmapItem->boundingRect());
 
@@ -3315,8 +3322,9 @@ void testDetect::updateZoomLabel()
 }
 
 // 灰度化模式下状态栏的像素读数: 坐标 + 灰度值 + 与边界阈值的关系。
-// 读的是 m_viewMat(显示图, 与识别输入同源), scene 坐标原点即图像左上角,
-// 所以视图缩放/平移后 mapToScene 仍能给出正确的像素下标。
+// 读的是 m_viewMat(显示图, 与识别输入同源)。底图被 setOffset(-0.5,-0.5) 左移过半个像素
+// (见 showImage), 所以像素 (i,j) 占的场景格子是 [i-0.5, i+0.5) —— 下标要写 floor(s+0.5),
+// 直接用 floor(s) 会整体差一列/一行。
 void testDetect::updatePixelInfo(const QPoint& viewportPos)
 {
     if (!m_pixelLabel)
@@ -3327,8 +3335,8 @@ void testDetect::updatePixelInfo(const QPoint& viewportPos)
     }
 
     const QPointF sp = m_view->mapToScene(viewportPos);
-    const int x = (int)std::floor(sp.x());
-    const int y = (int)std::floor(sp.y());
+    const int x = (int)std::floor(sp.x() + 0.5);
+    const int y = (int)std::floor(sp.y() + 0.5);
     if (x < 0 || y < 0 || x >= m_viewMat.cols || y >= m_viewMat.rows) {
         m_pixelLabel->clear();
         return;
