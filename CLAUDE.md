@@ -265,6 +265,25 @@ cp schneider0807/schneider0807/TargetDetector.h  0807testDetect/0807testDetect/i
 "$MSB" 0807testDetect/0807testDetect.sln -p:Configuration=Debug -p:Platform=x64 -m
 ```
 
+**Since the 2026-10-22 refactor the header is no longer self-contained**, so the sync is a four-file job,
+not three:
+- `DetectorParams` moved out to `TargetDetectorParams.h`; the host needs its own copy in
+  `0807testDetect/include/` (the `#include "TargetDetectorParams.h"` is relative to the header).
+- The host API (`params/setParams/defaultParams/detectTarget/detectMarkers/detectTargets/undistortImage/
+  setDebugView`) is now inside `#ifdef TD_OWNER`, so **both** configurations of `0807testDetect.vcxproj`
+  must define `TD_OWNER`. Without it the methods are simply not declared and the host won't compile.
+- Also re-copy `schneider0807.lib` — the export set grew, and the old import lib is a different size.
+
+**Why this bit us (2026-10-23):** the host header was left at the pre-refactor version while the new DLL
+was deployed. Debug `sizeof(TargetDetector)` was 840 (host) vs 872 (DLL) → the DLL's constructor wrote 32
+bytes past the object, straight into the next member `CameraProfile m_activeCamera`, and the app died at
+startup with `abort() has been called` (the debugger pointed at `_Check_C_return` in `thr/xthread`, which
+is only the `std::mutex`/`std::thread` failure path — a red herring). **Release did not fail because
+`sizeof` happened to be 832 on both sides**; offsets still differed. So "Release works" proves nothing —
+always compare sizes. Cheap check: an empty `main()` that prints `sizeof(TargetDetector)` compiled twice,
+once with `0807testDetect/include` and once with `#define TD_OWNER` + the DLL's own header dir, must print
+the same number for the same configuration (840/872 vs 832/832 above are the Debug/Release values).
+
 ⚠ In git-bash, msbuild switches must use the dash form (`-p:Configuration=...`). The `/p:...` form gets
 mangled by MSYS path conversion and fails with "只能指定一个项目".
 

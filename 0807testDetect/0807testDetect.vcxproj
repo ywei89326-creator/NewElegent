@@ -91,6 +91,9 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
+      <!-- TD_OWNER: 打开 TargetDetector.h 里的上位机接口(params/setParams/detectTarget/
+           detectMarkers/undistortImage)。不加这个宏, 这些方法在头文件里根本不声明。 -->
+      <PreprocessorDefinitions>TD_OWNER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -103,6 +106,8 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <DebugInformationFormat>None</DebugInformationFormat>
       <Optimization>MaxSpeed</Optimization>
+      <!-- 同 Debug: 上位机接口要靠 TD_OWNER 才声明 -->
+      <PreprocessorDefinitions>TD_OWNER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
